@@ -9,7 +9,13 @@
  */
 
 import { ConfigOptions } from '../common/configOptions';
-import { pythonVersion3_10, pythonVersion3_11, pythonVersion3_8 } from '../common/pythonVersion';
+import {
+    pythonVersion3_10,
+    pythonVersion3_11,
+    pythonVersion3_12,
+    pythonVersion3_13,
+    pythonVersion3_8,
+} from '../common/pythonVersion';
 import { Uri } from '../common/uri/uri';
 import * as TestUtils from './testUtils';
 
@@ -310,7 +316,7 @@ test('Protocol2', () => {
 test('Protocol3', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['protocol3.py']);
 
-    TestUtils.validateResults(analysisResults, 12);
+    TestUtils.validateResults(analysisResults, 13);
 });
 
 test('Protocol4', () => {
@@ -572,7 +578,7 @@ test('Protocol46', () => {
 test('Protocol47', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['protocol47.py']);
 
-    TestUtils.validateResults(analysisResults, 0);
+    TestUtils.validateResults(analysisResults, 2);
 });
 
 test('Protocol48', () => {
@@ -589,6 +595,18 @@ test('Protocol49', () => {
 
 test('Protocol50', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['protocol50.py']);
+
+    TestUtils.validateResults(analysisResults, 0);
+});
+
+test('Protocol51', () => {
+    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['protocol51.py']);
+
+    TestUtils.validateResults(analysisResults, 0);
+});
+
+test('Protocol52', () => {
+    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['protocol52.py']);
 
     TestUtils.validateResults(analysisResults, 0);
 });
@@ -749,6 +767,14 @@ test('TypedDict24', () => {
     TestUtils.validateResults(analysisResults, 1);
 });
 
+test('TypedDictInline1', () => {
+    const configOptions = new ConfigOptions(Uri.empty());
+    configOptions.diagnosticRuleSet.enableExperimentalFeatures = true;
+
+    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['typedDictInline1.py'], configOptions);
+    TestUtils.validateResults(analysisResults, 6);
+});
+
 test('ClassVar1', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['classVar1.py']);
 
@@ -769,6 +795,12 @@ test('ClassVar3', () => {
 
 test('ClassVar4', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['classVar4.py']);
+
+    TestUtils.validateResults(analysisResults, 0);
+});
+
+test('ClassVar5', () => {
+    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['classVar5.py']);
 
     TestUtils.validateResults(analysisResults, 0);
 });
@@ -816,9 +848,15 @@ test('TypeVar7', () => {
 });
 
 test('TypeVar8', () => {
-    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeVar8.py']);
+    const configOptions = new ConfigOptions(Uri.empty());
 
-    TestUtils.validateResults(analysisResults, 4);
+    configOptions.defaultPythonVersion = pythonVersion3_12;
+    const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['typeVar8.py'], configOptions);
+    TestUtils.validateResults(analysisResults1, 4);
+
+    configOptions.defaultPythonVersion = pythonVersion3_13;
+    const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['typeVar8.py'], configOptions);
+    TestUtils.validateResults(analysisResults2, 2);
 });
 
 test('TypeVar9', () => {
@@ -857,14 +895,6 @@ test('Annotated2', () => {
     TestUtils.validateResults(analysisResults, 0);
 });
 
-test('AnnotatedMetadata1', () => {
-    const configOptions = new ConfigOptions(Uri.empty());
-    configOptions.diagnosticRuleSet.enableExperimentalFeatures = true;
-
-    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['annotatedMetadata1.py'], configOptions);
-    TestUtils.validateResults(analysisResults, 6);
-});
-
 test('Circular1', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['circular1.py']);
 
@@ -898,7 +928,7 @@ test('TryExcept3', () => {
 test('TryExcept4', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['tryExcept4.py']);
 
-    TestUtils.validateResults(analysisResults, 2);
+    TestUtils.validateResults(analysisResults, 4);
 });
 
 test('TryExcept5', () => {
@@ -941,11 +971,11 @@ test('exceptionGroup1', () => {
 
     configOptions.defaultPythonVersion = pythonVersion3_10;
     const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['exceptionGroup1.py'], configOptions);
-    TestUtils.validateResults(analysisResults1, 9);
+    TestUtils.validateResults(analysisResults1, 28);
 
     configOptions.defaultPythonVersion = pythonVersion3_11;
     const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['exceptionGroup1.py'], configOptions);
-    TestUtils.validateResults(analysisResults2, 2);
+    TestUtils.validateResults(analysisResults2, 10);
 });
 
 test('Del1', () => {
@@ -962,7 +992,7 @@ test('Del2', () => {
 test('Any1', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['any1.py']);
 
-    TestUtils.validateResults(analysisResults, 6);
+    TestUtils.validateResults(analysisResults, 8);
 });
 
 test('Type1', () => {

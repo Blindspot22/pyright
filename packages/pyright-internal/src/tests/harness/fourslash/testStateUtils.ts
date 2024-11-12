@@ -14,7 +14,7 @@ import { combinePaths, getBaseFileName } from '../../../common/pathUtils';
 import { getStringComparer } from '../../../common/stringUtils';
 import * as vfs from '../vfs/filesystem';
 import { FourSlashData, FourSlashFile, GlobalMetadataOptionNames, Marker, MetadataOptionNames } from './fourSlashTypes';
-import { configFileName } from '../../../analyzer/serviceUtils';
+import { configFileName } from '../../../common/pathConsts';
 
 export function createVfsInfoFromFourSlashData(projectRoot: string, testData: FourSlashData) {
     const metaProjectRoot = testData.globalOptions[GlobalMetadataOptionNames.projectRoot];
@@ -72,6 +72,11 @@ export function getMarkerByName(testData: FourSlashData, markerName: string) {
 
 export function getMarkerNames(testData: FourSlashData): string[] {
     return [...testData.markerPositions.keys()];
+}
+
+export function getRangeByMarkerName(testData: FourSlashData, markerName: string) {
+    const marker = getMarkerByName(testData, markerName);
+    return testData.ranges.find((r) => r.marker === marker);
 }
 
 function isConfig(file: FourSlashFile, ignoreCase: boolean): boolean {

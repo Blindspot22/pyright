@@ -12,8 +12,14 @@ import { isAbsolute } from 'path';
 import { getPathsFromPthFiles } from '../analyzer/pythonPathUtils';
 import * as pathConsts from '../common/pathConsts';
 import { appendArray } from './collectionUtils';
-import { CommandLineOptions, DiagnosticSeverityOverrides, DiagnosticSeverityOverridesMap } from './commandLineOptions';
+import {
+    DiagnosticBooleanOverridesMap,
+    DiagnosticSeverityOverrides,
+    DiagnosticSeverityOverridesMap,
+    getDiagnosticSeverityOverrides,
+} from './commandLineOptions';
 import { ConsoleInterface, NullConsole } from './console';
+import { isBoolean } from './core';
 import { TaskListToken } from './diagnostic';
 import { DiagnosticRule } from './diagnosticRules';
 import { FileSystem } from './fileSystem';
@@ -51,6 +57,11 @@ export class ExecutionEnvironment {
     // Diagnostic rules with overrides.
     diagnosticRuleSet: DiagnosticRuleSet;
 
+    // Skip import resolution attempts for native libraries. These can
+    // be expensive and are not needed for some use cases (e.g. web-based
+    // tools or playgrounds).
+    skipNativeLibraries: boolean;
+
     // Default to "." which indicates every file in the project.
     constructor(
         name: string,
@@ -58,7 +69,8 @@ export class ExecutionEnvironment {
         defaultDiagRuleSet: DiagnosticRuleSet,
         defaultPythonVersion: PythonVersion | undefined,
         defaultPythonPlatform: string | undefined,
-        defaultExtraPaths: Uri[] | undefined
+        defaultExtraPaths: Uri[] | undefined,
+        skipNativeLibraries = false
     ) {
         this.name = name;
         this.root = root;
@@ -66,6 +78,7 @@ export class ExecutionEnvironment {
         this.pythonPlatform = defaultPythonPlatform;
         this.extraPaths = Array.from(defaultExtraPaths ?? []);
         this.diagnosticRuleSet = { ...defaultDiagRuleSet };
+        this.skipNativeLibraries = skipNativeLibraries;
     }
 }
 
@@ -119,11 +132,11 @@ export interface DiagnosticRuleSet {
     // Use tagged hints to identify unreachable code via type analysis?
     enableReachabilityAnalysis: boolean;
 
-    // No longer treat bytearray and memoryview as subclasses of bytes?
-    disableBytesTypePromotions: boolean;
-
     // Treat old typing aliases as deprecated if pythonVersion >= 3.9?
     deprecateTypingAliases: boolean;
+
+    // No longer treat bytearray and memoryview as subclasses of bytes?
+    disableBytesTypePromotions: boolean;
 
     // Report general type issues?
     reportGeneralTypeIssues: DiagnosticLevel;
@@ -404,7 +417,7 @@ export function getBooleanDiagnosticRules(includeNonOverridable = false) {
     ];
 
     if (includeNonOverridable) {
-        // Do not include this these because we don't
+        // Do not include these because we don't
         // want to override it in strict mode or support
         // it within pyright comments.
         boolRules.push(DiagnosticRule.enableTypeIgnoreComments);
@@ -524,7 +537,7 @@ export function getOffDiagnosticRuleSet(): DiagnosticRuleSet {
         enableTypeIgnoreComments: true,
         enableReachabilityAnalysis: false,
         deprecateTypingAliases: false,
-        disableBytesTypePromotions: false,
+        disableBytesTypePromotions: true,
         reportGeneralTypeIssues: 'none',
         reportPropertyTypeMismatch: 'none',
         reportFunctionMemberAccess: 'none',
@@ -627,7 +640,7 @@ export function getBasicDiagnosticRuleSet(): DiagnosticRuleSet {
         enableTypeIgnoreComments: true,
         enableReachabilityAnalysis: true,
         deprecateTypingAliases: false,
-        disableBytesTypePromotions: false,
+        disableBytesTypePromotions: true,
         reportGeneralTypeIssues: 'error',
         reportPropertyTypeMismatch: 'none',
         reportFunctionMemberAccess: 'none',
@@ -730,7 +743,7 @@ export function getStandardDiagnosticRuleSet(): DiagnosticRuleSet {
         enableTypeIgnoreComments: true,
         enableReachabilityAnalysis: true,
         deprecateTypingAliases: false,
-        disableBytesTypePromotions: false,
+        disableBytesTypePromotions: true,
         reportGeneralTypeIssues: 'error',
         reportPropertyTypeMismatch: 'none',
         reportFunctionMemberAccess: 'error',
@@ -1041,6 +1054,9 @@ export class ConfigOptions {
     // Default extraPaths. Can be overridden by executionEnvironment.
     defaultExtraPaths?: Uri[] | undefined;
 
+    // Should native library import resolutions be skipped?
+    skipNativeLibraries?: boolean;
+
     //---------------------------------------------------------------
     // Internal-only switches
 
@@ -1056,6 +1072,12 @@ export class ConfigOptions {
 
     // Controls how hover and completion function signatures are displayed.
     functionSignatureDisplay: SignatureDisplayType;
+
+    // Determines if has a config file (pyrightconfig.json or pyproject.toml) or not.
+    configFileSource?: Uri | undefined;
+
+    // Determines the effective default type checking mode.
+    effectiveTypeCheckingMode: 'strict' | 'basic' | 'off' | 'standard' = 'standard';
 
     constructor(projectRoot: Uri) {
         this.projectRoot = projectRoot;
@@ -1086,7 +1108,8 @@ export class ConfigOptions {
             this.diagnosticRuleSet,
             this.defaultPythonVersion,
             this.defaultPythonPlatform,
-            this.defaultExtraPaths
+            this.defaultExtraPaths,
+            this.skipNativeLibraries
         );
     }
 
@@ -1116,6 +1139,7 @@ export class ConfigOptions {
         severityOverrides?: DiagnosticSeverityOverridesMap
     ) {
         this.diagnosticRuleSet = ConfigOptions.getDiagnosticRuleSet(typeCheckingMode);
+        this.effectiveTypeCheckingMode = typeCheckingMode as 'strict' | 'basic' | 'off' | 'standard';
 
         if (severityOverrides) {
             this.applyDiagnosticOverrides(severityOverrides);
@@ -1123,13 +1147,7 @@ export class ConfigOptions {
     }
 
     // Initialize the structure from a JSON object.
-    initializeFromJson(
-        configObj: any,
-        configDirUri: Uri,
-        serviceProvider: ServiceProvider,
-        host: Host,
-        commandLineOptions?: CommandLineOptions
-    ) {
+    initializeFromJson(configObj: any, configDirUri: Uri, serviceProvider: ServiceProvider, host: Host) {
         this.initializedFromJson = true;
         const console = serviceProvider.tryGet(ServiceKeys.console) ?? new NullConsole();
 
@@ -1181,9 +1199,11 @@ export class ConfigOptions {
                 filesList.forEach((fileSpec, index) => {
                     if (typeof fileSpec !== 'string') {
                         console.error(`Index ${index} of "ignore" array should be a string.`);
-                    } else if (isAbsolute(fileSpec)) {
-                        console.error(`Ignoring path "${fileSpec}" in "ignore" array because it is not relative.`);
                     } else {
+                        // We'll allow absolute paths in the ignore list. While it
+                        // is not recommended to use absolute paths anywhere in
+                        // the config file, there are a few legit use cases for ignore
+                        // paths when the conf file is used with a language server.
                         this.ignore.push(getFileSpec(configDirUri, fileSpec));
                     }
                 });
@@ -1217,7 +1237,7 @@ export class ConfigOptions {
                 configObj.typeCheckingMode === 'standard' ||
                 configObj.typeCheckingMode === 'strict'
             ) {
-                this.diagnosticRuleSet = { ...ConfigOptions.getDiagnosticRuleSet(configObj.typeCheckingMode) };
+                this.initializeTypeCheckingMode(configObj.typeCheckingMode);
             } else {
                 console.error(`Config "typeCheckingMode" entry must contain "off", "basic", "standard", or "strict".`);
             }
@@ -1232,22 +1252,24 @@ export class ConfigOptions {
         }
 
         // Apply overrides from the config file for the boolean rules.
+        const configRuleSet = { ...this.diagnosticRuleSet };
         getBooleanDiagnosticRules(/* includeNonOverridable */ true).forEach((ruleName) => {
-            (this.diagnosticRuleSet as any)[ruleName] = this._convertBoolean(
+            (configRuleSet as any)[ruleName] = this._convertBoolean(
                 configObj[ruleName],
                 ruleName,
-                this.diagnosticRuleSet[ruleName] as boolean
+                configRuleSet[ruleName] as boolean
             );
         });
 
         // Apply overrides from the config file for the diagnostic level rules.
         getDiagLevelDiagnosticRules().forEach((ruleName) => {
-            (this.diagnosticRuleSet as any)[ruleName] = this._convertDiagnosticLevel(
+            (configRuleSet as any)[ruleName] = this._convertDiagnosticLevel(
                 configObj[ruleName],
                 ruleName,
-                this.diagnosticRuleSet[ruleName] as DiagnosticLevel
+                configRuleSet[ruleName] as DiagnosticLevel
             );
         });
+        this.diagnosticRuleSet = { ...configRuleSet };
 
         // Read the "venvPath".
         if (configObj.venvPath !== undefined) {
@@ -1267,9 +1289,9 @@ export class ConfigOptions {
             }
         }
 
-        // Read the default "extraPaths".
+        // Read the config "extraPaths".
+        const configExtraPaths: Uri[] = [];
         if (configObj.extraPaths !== undefined) {
-            this.defaultExtraPaths = [];
             if (!Array.isArray(configObj.extraPaths)) {
                 console.error(`Config "extraPaths" field must contain an array.`);
             } else {
@@ -1278,9 +1300,10 @@ export class ConfigOptions {
                     if (typeof path !== 'string') {
                         console.error(`Config "extraPaths" field ${pathIndex} must be a string.`);
                     } else {
-                        this.defaultExtraPaths!.push(configDirUri.resolvePaths(path));
+                        configExtraPaths!.push(configDirUri.resolvePaths(path));
                     }
                 });
+                this.defaultExtraPaths = [...configExtraPaths];
             }
         }
 
@@ -1298,13 +1321,6 @@ export class ConfigOptions {
             }
         }
 
-        // Override the default python version if it was specified on the command line.
-        if (commandLineOptions?.pythonVersion) {
-            this.defaultPythonVersion = commandLineOptions.pythonVersion;
-        }
-
-        this.ensureDefaultPythonVersion(host, console);
-
         // Read the default "pythonPlatform".
         if (configObj.pythonPlatform !== undefined) {
             if (typeof configObj.pythonPlatform !== 'string') {
@@ -1314,11 +1330,17 @@ export class ConfigOptions {
             }
         }
 
-        if (commandLineOptions?.pythonPlatform) {
-            this.defaultPythonPlatform = commandLineOptions.pythonPlatform;
+        // Read the skipNativeLibraries flag. This isn't officially documented
+        // or supported. It was added specifically to improve initialization
+        // performance for playgrounds or web-based environments where native
+        // libraries will not be present.
+        if (configObj.skipNativeLibraries) {
+            if (typeof configObj.skipNativeLibraries === 'boolean') {
+                this.skipNativeLibraries = configObj.skipNativeLibraries;
+            } else {
+                console.error(`Config "skipNativeLibraries" field must contain a boolean.`);
+            }
         }
-
-        this.ensureDefaultPythonPlatform(host, console);
 
         // Read the "typeshedPath" setting.
         if (configObj.typeshedPath !== undefined) {
@@ -1386,32 +1408,6 @@ export class ConfigOptions {
                 console.error(`Config "useLibraryCodeForTypes" field must be true or false.`);
             } else {
                 this.useLibraryCodeForTypes = configObj.useLibraryCodeForTypes;
-            }
-        }
-
-        // Read the "executionEnvironments" array. This should be done at the end
-        // after we've established default values.
-        if (configObj.executionEnvironments !== undefined) {
-            if (!Array.isArray(configObj.executionEnvironments)) {
-                console.error(`Config "executionEnvironments" field must contain an array.`);
-            } else {
-                this.executionEnvironments = [];
-
-                const execEnvironments = configObj.executionEnvironments as ExecutionEnvironment[];
-
-                execEnvironments.forEach((env, index) => {
-                    const execEnv = this._initExecutionEnvironmentFromJson(
-                        env,
-                        configDirUri,
-                        index,
-                        console,
-                        commandLineOptions
-                    );
-
-                    if (execEnv) {
-                        this.executionEnvironments.push(execEnv);
-                    }
-                });
             }
         }
 
@@ -1501,7 +1497,7 @@ export class ConfigOptions {
         const importFailureInfo: string[] = [];
         this.defaultPythonVersion = host.getPythonVersion(this.pythonPath, importFailureInfo);
         if (this.defaultPythonVersion !== undefined) {
-            console.info(`Assuming Python version ${this.defaultPythonVersion.toString()}`);
+            console.info(`Assuming Python version ${PythonVersion.toString(this.defaultPythonVersion)}`);
         }
 
         for (const log of importFailureInfo) {
@@ -1535,15 +1531,55 @@ export class ConfigOptions {
         }
     }
 
-    applyDiagnosticOverrides(diagnosticSeverityOverrides: DiagnosticSeverityOverridesMap | undefined) {
-        if (!diagnosticSeverityOverrides) {
+    applyDiagnosticOverrides(
+        diagnosticOverrides: DiagnosticSeverityOverridesMap | DiagnosticBooleanOverridesMap | undefined
+    ) {
+        if (!diagnosticOverrides) {
             return;
         }
 
         for (const ruleName of getDiagLevelDiagnosticRules()) {
-            const severity = diagnosticSeverityOverrides[ruleName];
-            if (severity !== undefined) {
+            const severity = diagnosticOverrides[ruleName];
+            if (severity !== undefined && !isBoolean(severity) && getDiagnosticSeverityOverrides().includes(severity)) {
                 (this.diagnosticRuleSet as any)[ruleName] = severity;
+            }
+        }
+
+        for (const ruleName of getBooleanDiagnosticRules(/* includeNonOverridable */ true)) {
+            const value = diagnosticOverrides[ruleName];
+            if (value !== undefined && isBoolean(value)) {
+                (this.diagnosticRuleSet as any)[ruleName] = value;
+            }
+        }
+    }
+
+    setupExecutionEnvironments(configObj: any, configDirUri: Uri, console: ConsoleInterface) {
+        // Read the "executionEnvironments" array. This should be done at the end
+        // after we've established default values.
+        if (configObj.executionEnvironments !== undefined) {
+            if (!Array.isArray(configObj.executionEnvironments)) {
+                console.error(`Config "executionEnvironments" field must contain an array.`);
+            } else {
+                this.executionEnvironments = [];
+
+                const execEnvironments = configObj.executionEnvironments as ExecutionEnvironment[];
+
+                execEnvironments.forEach((env, index) => {
+                    const execEnv = this._initExecutionEnvironmentFromJson(
+                        env,
+                        configDirUri,
+                        index,
+                        console,
+                        this.diagnosticRuleSet,
+                        this.defaultPythonVersion,
+                        this.defaultPythonPlatform,
+                        this.defaultExtraPaths || []
+                    );
+
+                    if (execEnv) {
+                        this.executionEnvironments.push(execEnv);
+                    }
+                });
             }
         }
     }
@@ -1583,16 +1619,19 @@ export class ConfigOptions {
         configDirUri: Uri,
         index: number,
         console: ConsoleInterface,
-        commandLineOptions?: CommandLineOptions
+        configDiagnosticRuleSet: DiagnosticRuleSet,
+        configPythonVersion: PythonVersion | undefined,
+        configPythonPlatform: string | undefined,
+        configExtraPaths: Uri[]
     ): ExecutionEnvironment | undefined {
         try {
             const newExecEnv = new ExecutionEnvironment(
                 this._getEnvironmentName(),
                 configDirUri,
-                this.diagnosticRuleSet,
-                this.defaultPythonVersion,
-                this.defaultPythonPlatform,
-                this.defaultExtraPaths
+                configDiagnosticRuleSet,
+                configPythonVersion,
+                configPythonPlatform,
+                configExtraPaths
             );
 
             // Validate the root.
@@ -1637,12 +1676,6 @@ export class ConfigOptions {
                 }
             }
 
-            // If the pythonVersion was specified on the command line, it overrides
-            // the configuration settings for the execution environment.
-            if (commandLineOptions?.pythonVersion) {
-                newExecEnv.pythonVersion = commandLineOptions.pythonVersion;
-            }
-
             // Validate the pythonPlatform.
             if (envObj.pythonPlatform) {
                 if (typeof envObj.pythonPlatform === 'string') {
@@ -1652,18 +1685,12 @@ export class ConfigOptions {
                 }
             }
 
-            // If the pythonPlatform was specified on the command line, it overrides
-            // the configuration settings for the execution environment.
-            if (commandLineOptions?.pythonPlatform) {
-                newExecEnv.pythonPlatform = commandLineOptions.pythonPlatform;
-            }
-
-            // Validate the name
+            // Validate the name.
             if (envObj.name) {
                 if (typeof envObj.name === 'string') {
                     newExecEnv.name = envObj.name;
                 } else {
-                    console.error(`Config executionEnvironments index ${index} pythonPlatform must be a string.`);
+                    console.error(`Config executionEnvironments index ${index} name must be a string.`);
                 }
             }
 

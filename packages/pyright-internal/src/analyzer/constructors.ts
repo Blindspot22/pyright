@@ -26,7 +26,7 @@ import {
     FunctionType,
     FunctionTypeFlags,
     InheritanceChain,
-    OverloadedFunctionType,
+    OverloadedType,
     Type,
     TypeVarType,
     UnknownType,
@@ -39,7 +39,7 @@ import {
     isFunction,
     isInstantiableClass,
     isNever,
-    isOverloadedFunction,
+    isOverloaded,
     isTypeVar,
     isUnknown,
 } from './types';
@@ -120,9 +120,12 @@ export function validateConstructorArgs(
     // If this is an unspecialized generic type alias, specialize it now
     // using default type argument values.
     const aliasInfo = type.props?.typeAliasInfo;
-    if (aliasInfo?.typeParams && !aliasInfo.typeArgs) {
+    if (aliasInfo?.shared.typeParams && !aliasInfo.typeArgs) {
         type = applySolvedTypeVars(type, new ConstraintSolution(), {
-            replaceUnsolved: { scopeIds: [aliasInfo.typeVarScopeId], tupleClassType: evaluator.getTupleClassType() },
+            replaceUnsolved: {
+                scopeIds: [aliasInfo.shared.typeVarScopeId],
+                tupleClassType: evaluator.getTupleClassType(),
+            },
         }) as ClassType;
     }
 
@@ -132,7 +135,8 @@ export function validateConstructorArgs(
         argList,
         type,
         skipUnknownArgCheck,
-        inferenceContext
+        inferenceContext,
+        /* useSpeculativeModeForArgs */ true
     );
 
     if (metaclassResult) {
@@ -143,6 +147,16 @@ export function validateConstructorArgs(
         // overrides the normal `type.__call__` logic and don't perform the usual
         // __new__ and __init__ validation.
         if (metaclassResult.argumentErrors || shouldSkipNewAndInitEvaluation(evaluator, type, metaclassReturnType)) {
+            validateMetaclassCall(
+                evaluator,
+                errorNode,
+                argList,
+                type,
+                skipUnknownArgCheck,
+                inferenceContext,
+                /* useSpeculativeModeForArgs */ false
+            );
+
             return metaclassResult;
         }
     }
@@ -196,17 +210,19 @@ export function validateConstructorArgs(
                 isTypeIncomplete: !!returnResult.isTypeIncomplete,
             });
 
-            returnResult.returnType = transformed.returnType;
+            if (transformed) {
+                returnResult.returnType = transformed.returnType;
 
-            if (transformed.isTypeIncomplete) {
-                returnResult.isTypeIncomplete = true;
+                if (transformed.isTypeIncomplete) {
+                    returnResult.isTypeIncomplete = true;
+                }
+
+                if (transformed.argumentErrors) {
+                    returnResult.argumentErrors = true;
+                }
+
+                validatedArgExpressions = true;
             }
-
-            if (transformed.argumentErrors) {
-                returnResult.argumentErrors = true;
-            }
-
-            validatedArgExpressions = true;
         }
     }
 
@@ -426,7 +442,6 @@ function validateNewMethod(
         argumentErrors = true;
 
         // Evaluate the arguments in a non-speculative manner to generate any diagnostics.
-        constraints.unlock();
         evaluator.validateCallArgs(
             errorNode,
             argList,
@@ -538,7 +553,7 @@ function validateFallbackConstructorCall(
     // If there was no object.__new__ or it's not a callable, then something has
     // gone terribly wrong in the typeshed stubs. To avoid crashing, simply
     // return the instance.
-    if (!newMethodType || (!isFunction(newMethodType) && !isOverloadedFunction(newMethodType))) {
+    if (!newMethodType || (!isFunction(newMethodType) && !isOverloaded(newMethodType))) {
         return { returnType: convertToInstance(type) };
     }
 
@@ -560,7 +575,8 @@ function validateMetaclassCall(
     argList: Arg[],
     type: ClassType,
     skipUnknownArgCheck: boolean | undefined,
-    inferenceContext: InferenceContext | undefined
+    inferenceContext: InferenceContext | undefined,
+    useSpeculativeModeForArgs: boolean
 ): CallResult | undefined {
     const metaclassCallMethodInfo = getBoundCallMethod(evaluator, errorNode, type);
 
@@ -568,24 +584,28 @@ function validateMetaclassCall(
         return undefined;
     }
 
-    const callResult = evaluator.validateCallArgs(
-        errorNode,
-        argList,
-        metaclassCallMethodInfo,
-        /* constraints */ undefined,
-        skipUnknownArgCheck,
-        inferenceContext
-    );
+    const callResult = evaluator.useSpeculativeMode(useSpeculativeModeForArgs ? errorNode : undefined, () => {
+        return evaluator.validateCallArgs(
+            errorNode,
+            argList,
+            metaclassCallMethodInfo,
+            /* constraints */ undefined,
+            skipUnknownArgCheck,
+            inferenceContext
+        );
+    });
 
-    // If the return type is unannotated, don't use the inferred return type.
-    const callType = metaclassCallMethodInfo.type;
-    if (isFunction(callType) && !callType.shared.declaredReturnType) {
-        return undefined;
-    }
+    if (!callResult.argumentErrors) {
+        // If the return type is unannotated, don't use the inferred return type.
+        const callType = metaclassCallMethodInfo.type;
+        if (isFunction(callType) && !callType.shared.declaredReturnType) {
+            return undefined;
+        }
 
-    // If the return type is unknown, ignore it.
-    if (callResult.returnType && isUnknown(callResult.returnType)) {
-        return undefined;
+        // If the return type is unknown, ignore it.
+        if (callResult.returnType && isUnknown(callResult.returnType)) {
+            return undefined;
+        }
     }
 
     return callResult;
@@ -695,7 +715,7 @@ export function createFunctionFromConstructor(
         return fromMetaclassCall;
     }
 
-    const fromNew = createFunctionFromNewMethod(evaluator, classType, selfType, recursionCount);
+    let fromNew = createFunctionFromNewMethod(evaluator, classType, selfType, recursionCount);
 
     if (fromNew) {
         let skipInitMethod = false;
@@ -714,6 +734,13 @@ export function createFunctionFromConstructor(
 
     const fromInit = createFunctionFromInitMethod(evaluator, classType, selfType, recursionCount);
 
+    // If there is a valid __init__ method and the __new__ method
+    // is the default __new__ method provided by the object class,
+    // discard the __new__ method.
+    if (fromInit && fromNew && isDefaultNewMethod(fromNew)) {
+        fromNew = undefined;
+    }
+
     // If there is both a __new__ and __init__ method, return a union
     // comprised of both resulting function types.
     if (fromNew && fromInit) {
@@ -731,7 +758,7 @@ function createFunctionFromMetaclassCall(
     evaluator: TypeEvaluator,
     classType: ClassType,
     recursionCount: number
-): FunctionType | OverloadedFunctionType | undefined {
+): FunctionType | OverloadedType | undefined {
     const metaclass = classType.shared.effectiveMetaclass;
     if (!metaclass || !isClass(metaclass)) {
         return undefined;
@@ -750,7 +777,7 @@ function createFunctionFromMetaclassCall(
     }
 
     const callType = evaluator.getTypeOfMember(callInfo);
-    if (!isFunction(callType) && !isOverloadedFunction(callType)) {
+    if (!isFunction(callType) && !isOverloaded(callType)) {
         return undefined;
     }
 
@@ -759,7 +786,7 @@ function createFunctionFromMetaclassCall(
         callType,
         callInfo && isInstantiableClass(callInfo.classType) ? callInfo.classType : undefined,
         /* treatConstructorAsClassMethod */ false,
-        ClassType.cloneAsInstantiable(classType),
+        classType,
         /* diag */ undefined,
         recursionCount
     );
@@ -790,7 +817,7 @@ function createFunctionFromNewMethod(
     classType: ClassType,
     selfType: ClassType | TypeVarType | undefined,
     recursionCount: number
-): FunctionType | OverloadedFunctionType | undefined {
+): FunctionType | OverloadedType | undefined {
     const newInfo = lookUpClassMember(
         classType,
         '__new__',
@@ -850,12 +877,12 @@ function createFunctionFromNewMethod(
         return convertNewToConstructor(newType);
     }
 
-    if (!isOverloadedFunction(newType)) {
+    if (!isOverloaded(newType)) {
         return undefined;
     }
 
     const newOverloads: FunctionType[] = [];
-    newType.priv.overloads.forEach((overload) => {
+    OverloadedType.getOverloads(newType).forEach((overload) => {
         const converted = convertNewToConstructor(overload);
         if (converted) {
             newOverloads.push(converted);
@@ -870,7 +897,7 @@ function createFunctionFromNewMethod(
         return newOverloads[0];
     }
 
-    return OverloadedFunctionType.create(newOverloads);
+    return OverloadedType.create(newOverloads);
 }
 
 function createFunctionFromObjectNewMethod(classType: ClassType) {
@@ -896,7 +923,7 @@ function createFunctionFromInitMethod(
     classType: ClassType,
     selfType: ClassType | TypeVarType | undefined,
     recursionCount: number
-): FunctionType | OverloadedFunctionType | undefined {
+): FunctionType | OverloadedType | undefined {
     // Use the __init__ method if available. It's usually more detailed.
     const initInfo = lookUpClassMember(
         classType,
@@ -980,12 +1007,12 @@ function createFunctionFromInitMethod(
         return convertInitToConstructor(initType);
     }
 
-    if (!isOverloadedFunction(initType)) {
+    if (!isOverloaded(initType)) {
         return undefined;
     }
 
     const initOverloads: FunctionType[] = [];
-    initType.priv.overloads.forEach((overload) => {
+    OverloadedType.getOverloads(initType).forEach((overload) => {
         const converted = convertInitToConstructor(overload);
         if (converted) {
             initOverloads.push(converted);
@@ -1000,7 +1027,7 @@ function createFunctionFromInitMethod(
         return initOverloads[0];
     }
 
-    return OverloadedFunctionType.create(initOverloads);
+    return OverloadedType.create(initOverloads);
 }
 
 // If the __call__ method returns a type that is not an instance of the class,
@@ -1041,7 +1068,11 @@ function shouldSkipInitEvaluation(evaluator: TypeEvaluator, classType: ClassType
 
         if (isClassInstance(subtype)) {
             const inheritanceChain: InheritanceChain = [];
-            const isDerivedFrom = ClassType.isDerivedFrom(subtype, classType, inheritanceChain);
+            const isDerivedFrom = ClassType.isDerivedFrom(
+                ClassType.cloneAsInstantiable(subtype),
+                classType,
+                inheritanceChain
+            );
 
             if (!isDerivedFrom) {
                 skipInitCheck = true;

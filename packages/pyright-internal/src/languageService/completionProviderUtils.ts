@@ -22,7 +22,7 @@ import {
     isClassInstance,
     isFunction,
     isModule,
-    isOverloadedFunction,
+    isOverloaded,
 } from '../analyzer/types';
 import { SignatureDisplayType } from '../common/configOptions';
 import { TextEditAction } from '../common/editAction';
@@ -91,13 +91,13 @@ export function getTypeDetail(
             if (type && TypeBase.isInstantiable(type)) {
                 const typeAliasInfo = getTypeAliasInfo(type);
                 if (typeAliasInfo) {
-                    if (typeAliasInfo.name === name) {
+                    if (typeAliasInfo.shared.name === name) {
                         expandTypeAlias = true;
                     }
                 }
             }
             // Handle the case where type is a function and was assigned to a variable.
-            if (type.category === TypeCategory.OverloadedFunction || type.category === TypeCategory.Function) {
+            if (type.category === TypeCategory.Overloaded || type.category === TypeCategory.Function) {
                 return getToolTipForType(
                     type,
                     /* label */ '',
@@ -113,7 +113,7 @@ export function getTypeDetail(
 
         case DeclarationType.Function: {
             const functionType =
-                detail?.boundObjectOrClass && (isFunction(type) || isOverloadedFunction(type))
+                detail?.boundObjectOrClass && (isFunction(type) || isOverloaded(type))
                     ? evaluator.bindFunctionToClassOrObject(detail.boundObjectOrClass, type)
                     : type;
             if (!functionType) {

@@ -92,6 +92,7 @@ test('Builtins1', () => {
         'PendingDeprecationWarning',
         'PermissionError',
         'ProcessLookupError',
+        'PythonFinalizationError',
         'RecursionError',
         'ReferenceError',
         'ResourceWarning',
@@ -480,6 +481,12 @@ test('TypeNarrowingIsinstance20', () => {
     TestUtils.validateResults(analysisResults, 0);
 });
 
+test('TypeNarrowingIsinstance21', () => {
+    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeNarrowingIsinstance21.py']);
+
+    TestUtils.validateResults(analysisResults, 0);
+});
+
 test('TypeNarrowingTupleLength1', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeNarrowingTupleLength1.py']);
 
@@ -777,7 +784,7 @@ test('Call1', () => {
 test('Call2', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['call2.py']);
 
-    TestUtils.validateResults(analysisResults, 17);
+    TestUtils.validateResults(analysisResults, 18);
 });
 
 test('Call3', () => {
@@ -815,7 +822,7 @@ test('Call6', () => {
 test('Call7', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['call7.py']);
 
-    TestUtils.validateResults(analysisResults, 4);
+    TestUtils.validateResults(analysisResults, 8);
 });
 
 test('Call8', () => {
@@ -863,7 +870,7 @@ test('Call14', () => {
 test('Call15', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['call15.py']);
 
-    TestUtils.validateResults(analysisResults, 6);
+    TestUtils.validateResults(analysisResults, 3);
 });
 
 test('Call16', () => {

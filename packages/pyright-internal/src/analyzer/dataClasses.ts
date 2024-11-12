@@ -11,7 +11,7 @@
 import { assert } from '../common/debug';
 import { DiagnosticAddendum } from '../common/diagnostic';
 import { DiagnosticRule } from '../common/diagnosticRules';
-import { pythonVersion3_13 } from '../common/pythonVersion';
+import { PythonVersion, pythonVersion3_13 } from '../common/pythonVersion';
 import { LocMessage } from '../localization/localize';
 import {
     ArgCategory,
@@ -32,7 +32,13 @@ import { ConstraintTracker } from './constraintTracker';
 import { createFunctionFromConstructor, getBoundInitMethod } from './constructors';
 import { DeclarationType } from './declaration';
 import { updateNamedTupleBaseClass } from './namedTuples';
-import { getClassFullName, getEnclosingClassOrFunction, getScopeIdForNode, getTypeSourceId } from './parseTreeUtils';
+import {
+    getClassFullName,
+    getEnclosingClassOrFunction,
+    getScopeIdForNode,
+    getTypeSourceId,
+    getTypeVarScopesForNode,
+} from './parseTreeUtils';
 import { evaluateStaticBoolExpression } from './staticExpressions';
 import { Symbol, SymbolFlags } from './symbol';
 import { isPrivateName } from './symbolNameUtils';
@@ -52,9 +58,9 @@ import {
     isClassInstance,
     isFunction,
     isInstantiableClass,
-    isOverloadedFunction,
+    isOverloaded,
     isUnion,
-    OverloadedFunctionType,
+    OverloadedType,
     TupleTypeArg,
     Type,
     TypeVarType,
@@ -65,13 +71,15 @@ import {
     applySolvedTypeVars,
     buildSolutionFromSpecializedClass,
     computeMroLinearization,
-    convertNodeToArg,
     convertToInstance,
     doForEachSignature,
     getTypeVarScopeId,
     getTypeVarScopeIds,
     isLiteralType,
     isMetaclassInstance,
+    makeInferenceContext,
+    makeTypeVarsBound,
+    makeTypeVarsFree,
     requiresSpecialization,
     specializeTupleClass,
     synthesizeTypeVarForSelfCls,
@@ -122,7 +130,12 @@ export function synthesizeDataClassMethods(
 
     // For Python 3.13 and newer, synthesize a __replace__ method.
     let replaceType: FunctionType | undefined;
-    if (AnalyzerNodeInfo.getFileInfo(node).executionEnvironment.pythonVersion >= pythonVersion3_13) {
+    if (
+        PythonVersion.isGreaterOrEqualTo(
+            AnalyzerNodeInfo.getFileInfo(node).executionEnvironment.pythonVersion,
+            pythonVersion3_13
+        )
+    ) {
         replaceType = FunctionType.createSynthesizedInstance('__replace__');
         FunctionType.addParam(replaceType, selfParam);
         FunctionType.addKeywordOnlyParamSeparator(replaceType);
@@ -134,6 +147,7 @@ export function synthesizeDataClassMethods(
     // entries added by this class.
     const localDataClassEntries: DataClassEntry[] = [];
     const fullDataClassEntries: DataClassEntry[] = [];
+    const namedTupleEntries = new Set<string>();
     const allAncestorsKnown = addInheritedDataClassEntries(classType, fullDataClassEntries);
 
     if (!allAncestorsKnown) {
@@ -204,10 +218,13 @@ export function synthesizeDataClassMethods(
             }
 
             let variableNameNode: NameNode | undefined;
+            let typeAnnotationNode: TypeAnnotationNode | undefined;
             let aliasName: string | undefined;
             let variableTypeEvaluator: EntryTypeEvaluator | undefined;
-            let hasDefaultValue = false;
+            let hasDefault = false;
+            let isDefaultFactory = false;
             let isKeywordOnly = ClassType.isDataClassKeywordOnly(classType) || sawKeywordOnlySeparator;
+            let defaultExpr: ExpressionNode | undefined;
             let includeInInit = true;
             let converter: ArgumentNode | undefined;
 
@@ -217,6 +234,7 @@ export function synthesizeDataClassMethods(
                     statement.d.leftExpr.d.valueExpr.nodeType === ParseNodeType.Name
                 ) {
                     variableNameNode = statement.d.leftExpr.d.valueExpr;
+                    typeAnnotationNode = statement.d.leftExpr;
                     const assignmentStatement = statement;
                     variableTypeEvaluator = () =>
                         evaluator.getTypeOfAnnotation(
@@ -229,7 +247,8 @@ export function synthesizeDataClassMethods(
                         );
                 }
 
-                hasDefaultValue = true;
+                hasDefault = true;
+                defaultExpr = statement.d.rightExpr;
 
                 // If the RHS of the assignment is assigning a field instance where the
                 // "init" parameter is set to false, do not include it in the init method.
@@ -285,14 +304,24 @@ export function synthesizeDataClassMethods(
                                 ) ?? isKeywordOnly;
                         }
 
-                        const defaultArg = statement.d.rightExpr.d.args.find(
-                            (arg) =>
-                                arg.d.name?.d.value === 'default' ||
-                                arg.d.name?.d.value === 'default_factory' ||
-                                arg.d.name?.d.value === 'factory'
+                        const defaultValueArg = statement.d.rightExpr.d.args.find(
+                            (arg) => arg.d.name?.d.value === 'default'
                         );
+                        hasDefault = !!defaultValueArg;
+                        if (defaultValueArg?.d.valueExpr) {
+                            defaultExpr = defaultValueArg.d.valueExpr;
+                        }
 
-                        hasDefaultValue = !!defaultArg;
+                        const defaultFactoryArg = statement.d.rightExpr.d.args.find(
+                            (arg) => arg.d.name?.d.value === 'default_factory' || arg.d.name?.d.value === 'factory'
+                        );
+                        if (defaultFactoryArg) {
+                            hasDefault = true;
+                            isDefaultFactory = true;
+                        }
+                        if (defaultFactoryArg?.d.valueExpr) {
+                            defaultExpr = defaultFactoryArg.d.valueExpr;
+                        }
 
                         const aliasArg = statement.d.rightExpr.d.args.find((arg) => arg.d.name?.d.value === 'alias');
                         if (aliasArg) {
@@ -317,6 +346,7 @@ export function synthesizeDataClassMethods(
             } else if (statement.nodeType === ParseNodeType.TypeAnnotation) {
                 if (statement.d.valueExpr.nodeType === ParseNodeType.Name) {
                     variableNameNode = statement.d.valueExpr;
+                    typeAnnotationNode = statement;
                     const annotationStatement = statement;
                     variableTypeEvaluator = () =>
                         evaluator.getTypeOfAnnotation(annotationStatement.d.annotation, {
@@ -332,6 +362,7 @@ export function synthesizeDataClassMethods(
                         if (isClassInstance(annotatedType) && ClassType.isBuiltIn(annotatedType, 'KW_ONLY')) {
                             sawKeywordOnlySeparator = true;
                             variableNameNode = undefined;
+                            typeAnnotationNode = undefined;
                             variableTypeEvaluator = undefined;
                         }
                     }
@@ -344,6 +375,7 @@ export function synthesizeDataClassMethods(
                 // Don't include class vars. PEP 557 indicates that they shouldn't
                 // be considered data class entries.
                 const variableSymbol = ClassType.getSymbolTable(classType).get(variableName);
+                namedTupleEntries.add(variableName);
 
                 if (variableSymbol?.isClassVar() && !variableSymbol?.isFinalVarInClassBody()) {
                     // If an ancestor class declared an instance variable but this dataclass
@@ -359,9 +391,12 @@ export function synthesizeDataClassMethods(
                         classType,
                         alias: aliasName,
                         isKeywordOnly: false,
-                        hasDefault: hasDefaultValue,
+                        hasDefault,
+                        isDefaultFactory,
+                        defaultExpr,
                         includeInInit,
                         nameNode: variableNameNode,
+                        typeAnnotationNode: typeAnnotationNode,
                         type: UnknownType.create(),
                         isClassVar: true,
                         converter,
@@ -376,9 +411,12 @@ export function synthesizeDataClassMethods(
                         classType,
                         alias: aliasName,
                         isKeywordOnly,
-                        hasDefault: hasDefaultValue,
+                        hasDefault,
+                        isDefaultFactory,
+                        defaultExpr,
                         includeInInit,
                         nameNode: variableNameNode,
+                        typeAnnotationNode: typeAnnotationNode,
                         type: UnknownType.create(),
                         isClassVar: false,
                         converter,
@@ -402,7 +440,8 @@ export function synthesizeDataClassMethods(
                         // causes overridden variables to "inherit" default values from parent classes.
                         if (!dataClassEntry.hasDefault && oldEntry.hasDefault && oldEntry.includeInInit) {
                             dataClassEntry.hasDefault = true;
-                            hasDefaultValue = true;
+                            dataClassEntry.defaultExpr = oldEntry.defaultExpr;
+                            hasDefault = true;
 
                             // Warn the user of this case because it can result in type errors if the
                             // default value is incompatible with the new type.
@@ -421,7 +460,7 @@ export function synthesizeDataClassMethods(
 
                     // If we've already seen a entry with a default value defined,
                     // all subsequent entries must also have default values.
-                    if (!isKeywordOnly && includeInInit && !skipSynthesizeInit && !hasDefaultValue) {
+                    if (!isKeywordOnly && includeInInit && !skipSynthesizeInit && !hasDefault) {
                         const firstDefaultValueIndex = fullDataClassEntries.findIndex(
                             (p) => p.hasDefault && p.includeInInit && !p.isKeywordOnly
                         );
@@ -477,7 +516,9 @@ export function synthesizeDataClassMethods(
         }
     });
 
-    if (!isNamedTuple) {
+    if (isNamedTuple) {
+        classType.shared.namedTupleEntries = namedTupleEntries;
+    } else {
         classType.shared.dataClassEntries = localDataClassEntries;
     }
 
@@ -497,6 +538,8 @@ export function synthesizeDataClassMethods(
         if (allAncestorsKnown) {
             fullDataClassEntries.forEach((entry) => {
                 if (entry.includeInInit) {
+                    let defaultType: Type | undefined;
+
                     // If the type refers to Self of the parent class, we need to
                     // transform it to refer to the Self of this subclass.
                     let effectiveType = entry.type;
@@ -518,12 +561,43 @@ export function synthesizeDataClassMethods(
                             getDescriptorForConverterField(
                                 evaluator,
                                 node,
+                                entry.nameNode,
+                                entry.typeAnnotationNode,
                                 entry.converter,
                                 entry.name,
                                 fieldType,
                                 effectiveType
                             )
                         );
+
+                        if (entry.hasDefault) {
+                            defaultType = entry.type;
+                        }
+                    } else {
+                        if (entry.hasDefault) {
+                            if (entry.isDefaultFactory || !entry.defaultExpr) {
+                                defaultType = entry.type;
+                            } else {
+                                const defaultExpr = entry.defaultExpr;
+                                const fileInfo = AnalyzerNodeInfo.getFileInfo(node);
+                                const flags = fileInfo.isStubFile ? EvalFlags.ConvertEllipsisToAny : EvalFlags.None;
+                                const liveTypeVars = getTypeVarScopesForNode(entry.defaultExpr);
+                                const boundEffectiveType = makeTypeVarsBound(effectiveType, liveTypeVars);
+
+                                // Use speculative mode here so we don't cache the results.
+                                // We'll want to re-evaluate this expression later, potentially
+                                // with different evaluation flags.
+                                defaultType = evaluator.useSpeculativeMode(defaultExpr, () => {
+                                    return evaluator.getTypeOfExpression(
+                                        defaultExpr,
+                                        flags,
+                                        makeInferenceContext(boundEffectiveType)
+                                    ).type;
+                                });
+
+                                defaultType = makeTypeVarsFree(defaultType, liveTypeVars);
+                            }
+                        }
                     }
 
                     const effectiveName = entry.alias || entry.name;
@@ -541,7 +615,8 @@ export function synthesizeDataClassMethods(
                         effectiveType,
                         FunctionParamFlags.TypeDeclared,
                         effectiveName,
-                        entry.hasDefault ? entry.type : undefined
+                        defaultType,
+                        entry.defaultExpr
                     );
 
                     if (entry.isKeywordOnly) {
@@ -624,9 +699,8 @@ export function synthesizeDataClassMethods(
     }
 
     if (ClassType.isDataClassGenerateOrder(classType)) {
-        const objType = ClassType.cloneAsInstance(classType);
         ['__lt__', '__le__', '__gt__', '__ge__'].forEach((operator) => {
-            synthesizeComparisonMethod(operator, objType);
+            synthesizeComparisonMethod(operator, selfType);
         });
     }
 
@@ -725,22 +799,22 @@ function getDefaultArgValueForFieldSpecifier(
 
     if (isFunction(callType)) {
         callTarget = callType;
-    } else if (isOverloadedFunction(callType)) {
+    } else if (isOverloaded(callType)) {
         callTarget = evaluator.getBestOverloadForArgs(
             callNode,
             { type: callType, isIncomplete: callTypeResult.isIncomplete },
-            callNode.d.args.map((arg) => convertNodeToArg(arg))
+            callNode.d.args.map((arg) => evaluator.convertNodeToArg(arg))
         );
     } else if (isInstantiableClass(callType)) {
         const initMethodResult = getBoundInitMethod(evaluator, callNode, callType);
         if (initMethodResult) {
             if (isFunction(initMethodResult.type)) {
                 callTarget = initMethodResult.type;
-            } else if (isOverloadedFunction(initMethodResult.type)) {
+            } else if (isOverloaded(initMethodResult.type)) {
                 callTarget = evaluator.getBestOverloadForArgs(
                     callNode,
                     { type: initMethodResult.type },
-                    callNode.d.args.map((arg) => convertNodeToArg(arg))
+                    callNode.d.args.map((arg) => evaluator.convertNodeToArg(arg))
                 );
             }
         }
@@ -811,7 +885,7 @@ function getConverterInputType(
     );
     FunctionType.addPositionOnlyParamSeparator(targetFunction);
 
-    if (isFunction(converterType) || isOverloadedFunction(converterType)) {
+    if (isFunction(converterType) || isOverloaded(converterType)) {
         const acceptedTypes: Type[] = [];
         const diagAddendum = new DiagnosticAddendum();
 
@@ -858,10 +932,14 @@ function getConverterInputType(
                 diagAddendum.getEffectiveTextRange() ?? converterNode
             );
         } else {
+            const overloads = OverloadedType.getOverloads(converterType);
             evaluator.addDiagnostic(
                 DiagnosticRule.reportGeneralTypeIssues,
                 LocMessage.dataClassConverterOverloads().format({
-                    funcName: converterType.priv.overloads[0].shared.name || '<anonymous function>',
+                    funcName:
+                        overloads.length > 0 && overloads[0].shared.name
+                            ? overloads[0].shared.name
+                            : '<anonymous function>',
                     fieldType: evaluator.printType(fieldType),
                     fieldName: fieldName,
                 }) + diagAddendum.getString(),
@@ -876,8 +954,8 @@ function getConverterInputType(
 function getConverterAsFunction(
     evaluator: TypeEvaluator,
     converterType: Type
-): FunctionType | OverloadedFunctionType | undefined {
-    if (isFunction(converterType) || isOverloadedFunction(converterType)) {
+): FunctionType | OverloadedType | undefined {
+    if (isFunction(converterType) || isOverloaded(converterType)) {
         return converterType;
     }
 
@@ -895,7 +973,7 @@ function getConverterAsFunction(
                 fromConstructor = fromConstructor.priv.subtypes[0];
             }
 
-            if (isFunction(fromConstructor) || isOverloadedFunction(fromConstructor)) {
+            if (isFunction(fromConstructor) || isOverloaded(fromConstructor)) {
                 return fromConstructor;
             }
         }
@@ -912,6 +990,8 @@ function getConverterAsFunction(
 function getDescriptorForConverterField(
     evaluator: TypeEvaluator,
     dataclassNode: ParseNode,
+    fieldNameNode: NameNode | undefined,
+    fieldAnnotationNode: TypeAnnotationNode | undefined,
     converterNode: ParseNode,
     fieldName: string,
     getType: Type,
@@ -971,7 +1051,7 @@ function getDescriptorForConverterField(
     const getSymbol = Symbol.createWithType(SymbolFlags.ClassMember, getFunction);
     fields.set('__get__', getSymbol);
 
-    return Symbol.createWithType(SymbolFlags.ClassMember, ClassType.cloneAsInstance(descriptorClass));
+    return Symbol.createWithType(SymbolFlags.ClassMember, ClassType.cloneAsInstance(descriptorClass), fieldNameNode);
 }
 
 // If the specified type is a descriptor — in particular, if it implements a
@@ -1042,8 +1122,11 @@ function isDataclassFieldConstructor(type: Type, fieldDescriptorNames: string[])
 
     if (isFunction(type)) {
         callName = type.shared.fullName;
-    } else if (isOverloadedFunction(type)) {
-        callName = type.priv.overloads[0].shared.fullName;
+    } else if (isOverloaded(type)) {
+        const overloads = OverloadedType.getOverloads(type);
+        if (overloads.length > 0) {
+            callName = overloads[0].shared.fullName;
+        }
     } else if (isInstantiableClass(type)) {
         callName = type.shared.fullName;
     }
@@ -1179,9 +1262,7 @@ export function validateDataClassTransformDecorator(
                     !valueType.priv.tupleTypeArgs ||
                     valueType.priv.tupleTypeArgs.some(
                         (entry) =>
-                            !isInstantiableClass(entry.type) &&
-                            !isFunction(entry.type) &&
-                            !isOverloadedFunction(entry.type)
+                            !isInstantiableClass(entry.type) && !isFunction(entry.type) && !isOverloaded(entry.type)
                     )
                 ) {
                     evaluator.addDiagnostic(
@@ -1197,8 +1278,11 @@ export function validateDataClassTransformDecorator(
                 valueType.priv.tupleTypeArgs.forEach((arg) => {
                     if (isInstantiableClass(arg.type) || isFunction(arg.type)) {
                         behaviors.fieldDescriptorNames.push(arg.type.shared.fullName);
-                    } else if (isOverloadedFunction(arg.type)) {
-                        behaviors.fieldDescriptorNames.push(arg.type.priv.overloads[0].shared.fullName);
+                    } else if (isOverloaded(arg.type)) {
+                        const overloads = OverloadedType.getOverloads(arg.type);
+                        if (overloads.length > 0) {
+                            behaviors.fieldDescriptorNames.push(overloads[0].shared.fullName);
+                        }
                     }
                 });
                 break;
@@ -1221,13 +1305,22 @@ export function getDataclassDecoratorBehaviors(type: Type): DataClassBehaviors |
     let functionType: FunctionType | undefined;
     if (isFunction(type)) {
         functionType = type;
-    } else if (isOverloadedFunction(type)) {
+    } else if (isOverloaded(type)) {
         // Find the first overload or implementation that contains a
         // dataclass_transform decorator. If more than one have such a decorator,
         // only the first one will be honored, as per PEP 681.
-        functionType =
-            type.priv.overloads.find((overload) => !!overload.shared.decoratorDataClassBehaviors) ??
-            type.priv.overloads[0];
+        const overloads = OverloadedType.getOverloads(type);
+        const impl = OverloadedType.getImplementation(type);
+
+        functionType = overloads.find((overload) => !!overload.shared.decoratorDataClassBehaviors);
+
+        if (!functionType && impl && isFunction(impl) && impl.shared.decoratorDataClassBehaviors) {
+            functionType = impl;
+        }
+
+        if (!functionType && overloads.length > 0) {
+            functionType = overloads[0];
+        }
     }
 
     if (!functionType) {
@@ -1430,7 +1523,7 @@ export function applyDataClassDecorator(
         evaluator,
         errorNode,
         classType,
-        (callNode?.d.args ?? []).map((arg) => convertNodeToArg(arg)),
+        (callNode?.d.args ?? []).map((arg) => evaluator.convertNodeToArg(arg)),
         defaultBehaviors
     );
 }

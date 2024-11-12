@@ -6,6 +6,7 @@
  * TestState wraps currently test states and provides a way to query and manipulate
  * the test states.
  */
+
 import assert from 'assert';
 import * as path from 'path';
 import {
@@ -37,9 +38,10 @@ import { Char } from '../../../common/charCodes';
 import { CommandLineOptions } from '../../../common/commandLineOptions';
 import { ConfigOptions, SignatureDisplayType } from '../../../common/configOptions';
 import { ConsoleInterface, ConsoleWithLogLevel, NullConsole } from '../../../common/console';
-import { Comparison, isNumber, isString, toBoolean } from '../../../common/core';
+import { Comparison, isNumber, isString } from '../../../common/core';
 import * as debug from '../../../common/debug';
 import { DiagnosticCategory } from '../../../common/diagnostic';
+import { PyrightDocStringService } from '../../../common/docStringService';
 import { FileEditAction } from '../../../common/editAction';
 import { ReadOnlyFileSystem } from '../../../common/fileSystem';
 import { LanguageServerInterface } from '../../../common/languageServerInterface';
@@ -71,13 +73,7 @@ import { ParseNode } from '../../../parser/parseNodes';
 import { ParseFileResults } from '../../../parser/parser';
 import { Tokenizer } from '../../../parser/tokenizer';
 import { PyrightFileSystem } from '../../../pyrightFileSystem';
-import {
-    NormalWorkspace,
-    WellKnownWorkspaceKinds,
-    Workspace,
-    WorkspacePythonPathKind,
-    createInitStatus,
-} from '../../../workspaceFactory';
+import { NormalWorkspace, WellKnownWorkspaceKinds, Workspace, createInitStatus } from '../../../workspaceFactory';
 import { TestAccessHost } from '../testAccessHost';
 import * as host from '../testHost';
 import { stringify } from '../utils';
@@ -87,7 +83,6 @@ import { parseTestData } from './fourSlashParser';
 import {
     FourSlashData,
     FourSlashFile,
-    GlobalMetadataOptionNames,
     Marker,
     MetadataOptionNames,
     MultiMap,
@@ -95,9 +90,14 @@ import {
     TestCancellationToken,
 } from './fourSlashTypes';
 import { TestFeatures, TestLanguageService } from './testLanguageService';
-import { createVfsInfoFromFourSlashData, getMarkerByName, getMarkerName, getMarkerNames } from './testStateUtils';
+import {
+    createVfsInfoFromFourSlashData,
+    getMarkerByName,
+    getMarkerName,
+    getMarkerNames,
+    getRangeByMarkerName,
+} from './testStateUtils';
 import { verifyWorkspaceEdit } from './workspaceEditTestUtils';
-import { PyrightDocStringService } from '../../../common/docStringService';
 
 export interface TextChange {
     span: TextRange;
@@ -108,7 +108,6 @@ export interface HostSpecificFeatures {
     importResolverFactory: ImportResolverFactory;
     backgroundAnalysisProgramFactory: BackgroundAnalysisProgramFactory;
 
-    runIndexer(workspace: Workspace, noStdLib: boolean, options?: string): void;
     getCodeActionsForPosition(
         workspace: Workspace,
         fileUri: Uri,
@@ -181,13 +180,10 @@ export class TestState {
         const configOptions = this._convertGlobalOptionsToConfigOptions(vfsInfo.projectRoot, mountPaths);
 
         if (this.rawConfigJson) {
+            const configDirUri = Uri.file(projectRoot, this.serviceProvider);
             configOptions.initializeTypeCheckingMode('standard');
-            configOptions.initializeFromJson(
-                this.rawConfigJson,
-                Uri.file(projectRoot, this.serviceProvider),
-                this.serviceProvider,
-                testAccessHost
-            );
+            configOptions.initializeFromJson(this.rawConfigJson, configDirUri, this.serviceProvider, testAccessHost);
+            configOptions.setupExecutionEnvironments(this.rawConfigJson, configDirUri, this.serviceProvider.console());
             this._applyTestConfigOptions(configOptions);
         }
 
@@ -201,8 +197,6 @@ export class TestState {
         this.workspace = {
             workspaceName: 'test workspace',
             rootUri: Uri.file(vfsInfo.projectRoot, this.serviceProvider),
-            pythonPath: undefined,
-            pythonPathKind: WorkspacePythonPathKind.Mutable,
             kinds: [WellKnownWorkspaceKinds.Test],
             service: service,
             disableLanguageServices: false,
@@ -211,16 +205,7 @@ export class TestState {
             disableWorkspaceSymbol: false,
             isInitialized: createInitStatus(),
             searchPathsToWatch: [],
-            pythonEnvironmentName: undefined,
         };
-
-        const indexer = toBoolean(testData.globalOptions[GlobalMetadataOptionNames.indexer]);
-        const indexerWithoutStdLib = toBoolean(testData.globalOptions[GlobalMetadataOptionNames.indexerWithoutStdLib]);
-        if (indexer || indexerWithoutStdLib) {
-            const indexerOptions = testData.globalOptions[GlobalMetadataOptionNames.indexerOptions];
-            configOptions.indexing = true;
-            this._hostSpecificFeatures.runIndexer(this.workspace, indexerWithoutStdLib, indexerOptions);
-        }
 
         if (!delayFileInitialization) {
             this.initializeFiles();
@@ -435,8 +420,7 @@ export class TestState {
     }
 
     getRangeByMarkerName(markerName: string): Range | undefined {
-        const marker = this.getMarkerByName(markerName);
-        return this.getRanges().find((r) => r.marker === marker);
+        return getRangeByMarkerName(this.testData, markerName);
     }
 
     goToBOF() {
@@ -709,6 +693,13 @@ export class TestState {
                 continue;
             }
 
+            const uri = Uri.file(range.fileName, this.serviceProvider);
+            const sourceFile = this.program.getSourceFile(uri);
+            if (!sourceFile) {
+                this.raiseError(`source file not found: ${range.fileName}`);
+            }
+            const diagnostics = sourceFile.getDiagnostics(this.configOptions) || [];
+
             const codeActions = await this._getCodeActions(range);
             if (verifyMode === 'exact') {
                 if (codeActions.length !== map[name].codeActions.length) {
@@ -750,8 +741,17 @@ export class TestState {
                 if (verifyMode === 'excluded' && matches.length > 0) {
                     this.raiseError(`unexpected result: ${stringify(map[name])}`);
                 } else if (verifyMode !== 'excluded' && matches.length !== 1) {
+                    const uri = Uri.file('test2.py', this.serviceProvider);
+                    const sourceFile = this.program.getSourceFile(uri);
+                    const symbolsInTest2 = sourceFile
+                        ? ', symbols in test2.py: ' +
+                          Array.from(sourceFile.getModuleSymbolTable()?.keys() ?? []).join(',')
+                        : '';
+
                     this.raiseError(
-                        `doesn't contain expected result: ${stringify(expected)}, actual: ${stringify(codeActions)}`
+                        `doesn't contain expected result: ${stringify(expected)}, actual: ${stringify(
+                            codeActions
+                        )}, diagnostics: ${stringify(diagnostics)}${symbolsInTest2}`
                     );
                 }
             }
@@ -1505,9 +1505,9 @@ export class TestState {
     ) {
         const commandLineOptions = new CommandLineOptions(
             this.configOptions.projectRoot.getFilePath(),
-            /* fromVsCodeExtension */ false
+            /* fromLanguageServer */ false
         );
-        commandLineOptions.verboseOutput = verboseOutput;
+        commandLineOptions.configSettings.verboseOutput = verboseOutput;
         const verifier = new PackageTypeVerifier(
             this.serviceProvider,
             testAccessHost,
@@ -1960,6 +1960,7 @@ export class TestState {
             backgroundAnalysisProgramFactory,
             configOptions,
             fileSystem: this.fs,
+            libraryReanalysisTimeProvider: () => 0,
         });
 
         // directly set files to track rather than using fileSpec from config

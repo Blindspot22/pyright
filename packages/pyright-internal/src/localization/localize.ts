@@ -42,8 +42,8 @@ export class ParameterizedString<T extends {}> {
 }
 
 const defaultLocale = 'en-us';
-const stringMapsByLocale: Map<string, any> = new Map([
-    ['cs', csStrings],
+const stringMapsByLocale: Map<string, StringLookupMap> = new Map([
+    ['cs', csStrings as StringLookupMap],
     ['de', deStrings],
     ['en-us', enUsStrings],
     ['en', enUsStrings],
@@ -61,7 +61,12 @@ const stringMapsByLocale: Map<string, any> = new Map([
     ['zh-tw', zhTwStrings],
 ]);
 
-type StringLookupMap = { [key: string]: string | StringLookupMap };
+type CommentedStringValue = {
+    message: string;
+    comment: string[];
+};
+
+export type StringLookupMap = { [key: string]: string | CommentedStringValue | StringLookupMap };
 let localizedStrings: StringLookupMap | undefined = undefined;
 let defaultStrings: StringLookupMap = {};
 
@@ -71,8 +76,13 @@ function getRawStringDefault(key: string): string {
     }
 
     const keyParts = key.split('.');
+    const isDiagnostic = keyParts[0] === 'Diagnostic' || keyParts[0] === 'DiagnosticAddendum';
 
-    const str = getRawStringFromMap(localizedStrings, keyParts) || getRawStringFromMap(defaultStrings, keyParts);
+    const str =
+        isDiagnostic && forceEnglishDiagnostics
+            ? getRawStringFromMap(defaultStrings, keyParts)
+            : getRawStringFromMap(localizedStrings, keyParts) || getRawStringFromMap(defaultStrings, keyParts);
+
     if (str) {
         return str;
     }
@@ -101,7 +111,7 @@ export function getRawStringFromMap(map: StringLookupMap, keyParts: string[]): s
         curObj = curObj[keyPart];
     }
 
-    return curObj as string;
+    return typeof curObj === 'string' ? curObj : curObj.message;
 }
 
 function initialize(): StringLookupMap {
@@ -111,11 +121,16 @@ function initialize(): StringLookupMap {
 }
 
 let localeOverride: string | undefined;
+let forceEnglishDiagnostics = false;
 
 export function setLocaleOverride(locale: string) {
     // Force a reload of the localized strings.
     localizedStrings = undefined;
     localeOverride = locale.toLowerCase();
+}
+
+export function setForceEnglishDiagnostics(force: boolean) {
+    forceEnglishDiagnostics = force;
 }
 
 export function getLocaleFromEnv(): string {
@@ -162,7 +177,7 @@ function loadDefaultStrings(): StringLookupMap {
     return {};
 }
 
-export function loadStringsForLocale(locale: string, localeMap: Map<string, any>): StringLookupMap {
+export function loadStringsForLocale(locale: string, localeMap: Map<string, StringLookupMap>): StringLookupMap {
     if (locale === defaultLocale) {
         // No need to load override if we're using the default.
         return {};
@@ -269,6 +284,7 @@ export namespace Localizer {
             new ParameterizedString<{ type: string; methodName: string; paramName: string }>(
                 getRawString('Diagnostic.bindTypeMismatch')
             );
+        export const breakInExceptionGroup = () => getRawString('Diagnostic.breakInExceptionGroup');
         export const breakOutsideLoop = () => getRawString('Diagnostic.breakOutsideLoop');
         export const callableExtraArgs = () => getRawString('Diagnostic.callableExtraArgs');
         export const callableFirstArg = () => getRawString('Diagnostic.callableFirstArg');
@@ -341,7 +357,7 @@ export namespace Localizer {
             new ParameterizedString<{ leftType: string; rightType: string }>(
                 getRawString('Diagnostic.containmentAlwaysTrue')
             );
-        export const continueInFinally = () => getRawString('Diagnostic.continueInFinally');
+        export const continueInExceptionGroup = () => getRawString('Diagnostic.continueInExceptionGroup');
         export const continueOutsideLoop = () => getRawString('Diagnostic.continueOutsideLoop');
         export const dataClassBaseClassFrozen = () => getRawString('Diagnostic.dataClassBaseClassFrozen');
         export const dataClassBaseClassNotFrozen = () => getRawString('Diagnostic.dataClassBaseClassNotFrozen');
@@ -440,6 +456,8 @@ export namespace Localizer {
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.enumMemberSet'));
         export const enumMemberTypeAnnotation = () => getRawString('Diagnostic.enumMemberTypeAnnotation');
         export const exceptionGroupIncompatible = () => getRawString('Diagnostic.exceptionGroupIncompatible');
+        export const exceptGroupMismatch = () => getRawString('Diagnostic.exceptGroupMismatch');
+        export const exceptGroupRequiresType = () => getRawString('Diagnostic.exceptGroupRequiresType');
         export const exceptionGroupTypeIncorrect = () => getRawString('Diagnostic.exceptionGroupTypeIncorrect');
         export const exceptionTypeIncorrect = () =>
             new ParameterizedString<{ type: string }>(getRawString('Diagnostic.exceptionTypeIncorrect'));
@@ -469,10 +487,10 @@ export namespace Localizer {
         export const expectedExceptionClass = () => getRawString('Diagnostic.expectedExceptionClass');
         export const expectedExceptionObj = () => getRawString('Diagnostic.expectedExceptionObj');
         export const expectedExpr = () => getRawString('Diagnostic.expectedExpr');
+        export const expectedIdentifier = () => getRawString('Diagnostic.expectedIdentifier');
         export const expectedImport = () => getRawString('Diagnostic.expectedImport');
         export const expectedImportAlias = () => getRawString('Diagnostic.expectedImportAlias');
         export const expectedImportSymbols = () => getRawString('Diagnostic.expectedImportSymbols');
-        export const expectedIdentifier = () => getRawString('Diagnostic.expectedIdentifier');
         export const expectedIndentedBlock = () => getRawString('Diagnostic.expectedIndentedBlock');
         export const expectedIn = () => getRawString('Diagnostic.expectedIn');
         export const expectedInExpr = () => getRawString('Diagnostic.expectedInExpr');
@@ -644,6 +662,7 @@ export namespace Localizer {
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.methodReturnsNonObject'));
         export const missingSuperCall = () =>
             new ParameterizedString<{ methodName: string }>(getRawString('Diagnostic.missingSuperCall'));
+        export const mixingBytesAndStr = () => getRawString('Diagnostic.mixingBytesAndStr');
         export const moduleAsType = () => getRawString('Diagnostic.moduleAsType');
         export const moduleNotCallable = () => getRawString('Diagnostic.moduleNotCallable');
         export const moduleUnknownMember = () =>
@@ -722,6 +741,8 @@ export namespace Localizer {
             );
         export const overloadAbstractMismatch = () =>
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.overloadAbstractMismatch'));
+        export const overloadAbstractImplMismatch = () =>
+            new ParameterizedString<{ name: string }>(getRawString('Diagnostic.overloadAbstractImplMismatch'));
         export const overloadClassMethodInconsistent = () =>
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.overloadClassMethodInconsistent'));
         export const overloadFinalInconsistencyImpl = () =>
@@ -755,6 +776,8 @@ export namespace Localizer {
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.paramAnnotationMissing'));
         export const paramNameMissing = () =>
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.paramNameMissing'));
+        export const paramSpecArgsKwargsDuplicate = () =>
+            new ParameterizedString<{ type: string }>(getRawString('Diagnostic.paramSpecArgsKwargsDuplicate'));
         export const paramSpecArgsKwargsUsage = () => getRawString('Diagnostic.paramSpecArgsKwargsUsage');
         export const paramSpecArgsMissing = () =>
             new ParameterizedString<{ type: string }>(getRawString('Diagnostic.paramSpecArgsMissing'));
@@ -846,6 +869,7 @@ export namespace Localizer {
         export const returnInAsyncGenerator = () => getRawString('Diagnostic.returnInAsyncGenerator');
         export const returnMissing = () =>
             new ParameterizedString<{ returnType: string }>(getRawString('Diagnostic.returnMissing'));
+        export const returnInExceptionGroup = () => getRawString('Diagnostic.returnInExceptionGroup');
         export const returnOutsideFunction = () => getRawString('Diagnostic.returnOutsideFunction');
         export const returnTypeContravariant = () => getRawString('Diagnostic.returnTypeContravariant');
         export const returnTypeMismatch = () =>
@@ -978,6 +1002,7 @@ export namespace Localizer {
         export const typedDictEntryName = () => getRawString('Diagnostic.typedDictEntryName');
         export const typedDictEntryUnique = () => getRawString('Diagnostic.typedDictEntryUnique');
         export const typedDictExtraArgs = () => getRawString('Diagnostic.typedDictExtraArgs');
+        export const typedDictExtraItemsClosed = () => getRawString('Diagnostic.typedDictExtraItemsClosed');
         export const typedDictFieldNotRequiredRedefinition = () =>
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.typedDictFieldNotRequiredRedefinition'));
         export const typedDictFieldReadOnlyRedefinition = () =>
@@ -985,6 +1010,7 @@ export namespace Localizer {
         export const typedDictFieldRequiredRedefinition = () =>
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.typedDictFieldRequiredRedefinition'));
         export const typedDictFirstArg = () => getRawString('Diagnostic.typedDictFirstArg');
+        export const typedDictInClassPattern = () => getRawString('Diagnostic.typedDictInClassPattern');
         export const typedDictInitsubclassParameter = () =>
             new ParameterizedString<{ name: string }>(getRawString('Diagnostic.typedDictInitsubclassParameter'));
         export const typedDictNotAllowed = () => getRawString('Diagnostic.typedDictNotAllowed');
@@ -993,6 +1019,7 @@ export namespace Localizer {
         export const typedDictSet = () => getRawString('Diagnostic.typedDictSet');
         export const typeExpectedClass = () =>
             new ParameterizedString<{ type: string }>(getRawString('Diagnostic.typeExpectedClass'));
+        export const typeFormArgs = () => getRawString('Diagnostic.typeFormArgs');
         export const typeGuardArgCount = () => getRawString('Diagnostic.typeGuardArgCount');
         export const typeGuardParamCount = () => getRawString('Diagnostic.typeGuardParamCount');
         export const typeIsReturnType = () =>
@@ -1124,6 +1151,14 @@ export namespace Localizer {
         export const unnecessaryIsSubclassAlways = () =>
             new ParameterizedString<{ testType: string; classType: string }>(
                 getRawString('Diagnostic.unnecessaryIsSubclassAlways')
+            );
+        export const unnecessaryIsInstanceNever = () =>
+            new ParameterizedString<{ testType: string; classType: string }>(
+                getRawString('Diagnostic.unnecessaryIsInstanceNever')
+            );
+        export const unnecessaryIsSubclassNever = () =>
+            new ParameterizedString<{ testType: string; classType: string }>(
+                getRawString('Diagnostic.unnecessaryIsSubclassNever')
             );
         export const unnecessaryPyrightIgnore = () => getRawString('Diagnostic.unnecessaryPyrightIgnore');
         export const unnecessaryPyrightIgnoreRule = () =>
@@ -1303,8 +1338,6 @@ export namespace Localizer {
             new ParameterizedString<{ count: number }>(getRawString('DiagnosticAddendum.memberIsAbstractMore'));
         export const memberIsClassVarInProtocol = () =>
             new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsClassVarInProtocol'));
-        export const memberIsFinalInProtocol = () =>
-            new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsFinalInProtocol'));
         export const memberIsInitVar = () =>
             new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsInitVar'));
         export const memberIsInvariant = () =>
@@ -1313,8 +1346,10 @@ export namespace Localizer {
             new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsNotClassVarInClass'));
         export const memberIsNotClassVarInProtocol = () =>
             new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsNotClassVarInProtocol'));
-        export const memberIsNotFinalInProtocol = () =>
-            new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsNotFinalInProtocol'));
+        export const memberIsNotReadOnlyInProtocol = () =>
+            new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsNotReadOnlyInProtocol'));
+        export const memberIsReadOnlyInProtocol = () =>
+            new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsReadOnlyInProtocol'));
         export const memberIsWritableInProtocol = () =>
             new ParameterizedString<{ name: string }>(getRawString('DiagnosticAddendum.memberIsWritableInProtocol'));
         export const memberSetClassVar = () =>

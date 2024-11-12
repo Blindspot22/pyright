@@ -491,7 +491,6 @@ const ClassTypeFlagsToString: [ClassTypeFlags, string][] = [
     [ClassTypeFlags.PropertyClass, 'PropertyClass'],
     [ClassTypeFlags.ProtocolClass, 'ProtocolClass'],
     [ClassTypeFlags.PseudoGenericClass, 'PseudoGenericClass'],
-    [ClassTypeFlags.ReadOnlyInstanceVariables, 'ReadOnlyInstanceVariables'],
     [ClassTypeFlags.RuntimeCheckable, 'RuntimeCheckable'],
     [ClassTypeFlags.SpecialBuiltIn, 'SpecialBuiltIn'],
     [ClassTypeFlags.SupportsAbstractMethods, 'SupportsAbstractMethods'],
@@ -532,8 +531,8 @@ function getTypeCategoryString(typeCategory: TypeCategory, type: any) {
             return 'Never';
         case TypeCategory.Function:
             return 'Function';
-        case TypeCategory.OverloadedFunction:
-            return 'OverloadedFunction';
+        case TypeCategory.Overloaded:
+            return 'Overloaded';
         case TypeCategory.Class:
             if (TypeBase.isInstantiable(type)) {
                 return 'Class';

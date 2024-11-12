@@ -930,6 +930,11 @@ export function getEvaluationScopeNode(node: ParseNode): EvaluationScopeInfo {
                     break;
                 }
 
+                // The name of the function is evaluated within the containing scope.
+                if (prevNode === curNode.d.name) {
+                    break;
+                }
+
                 if (curNode.d.params.some((param) => param === prevNode)) {
                     // Default argument expressions are evaluated outside of the function scope.
                     if (isParamDefaultNode) {
@@ -1087,9 +1092,12 @@ export function getExecutionScopeNode(node: ParseNode): ExecutionScopeNode {
     let evaluationScope = getEvaluationScopeNode(node).node;
 
     // Classes are not considered execution scope because they are executed
-    // within the context of their containing module or function. Likewise, list
-    // comprehensions are executed within their container.
+    // within the context of their containing module or function. Likewise,
+    // list comprehensions are executed within their container. Type parameter
+    // scopes are special because they act as proxies for their containing
+    // function or class scope.
     while (
+        evaluationScope.nodeType === ParseNodeType.TypeParameterList ||
         evaluationScope.nodeType === ParseNodeType.Class ||
         evaluationScope.nodeType === ParseNodeType.Comprehension
     ) {
@@ -2790,6 +2798,10 @@ export function getVariableDocStringNode(node: ExpressionNode): StringListNode |
             break;
         }
 
+        if (curNode.nodeType === ParseNodeType.Suite) {
+            break;
+        }
+
         if (curNode.nodeType === ParseNodeType.TypeAnnotation && !annotationNode) {
             annotationNode = curNode;
         }
@@ -2872,7 +2884,7 @@ export function getScopeIdForNode(node: ParseNode): string {
     }
 
     const fileInfo = AnalyzerNodeInfo.getFileInfo(node);
-    return `${fileInfo.fileUri.key}.${node.start.toString()}-${name}`;
+    return `${fileInfo.fileId}.${node.start.toString()}-${name}`;
 }
 
 // Walks up the parse tree and finds all scopes that can provide

@@ -49,6 +49,7 @@ import {
     isTypeSame,
     isUnknown,
     ModuleType,
+    OverloadedType,
     Type,
     TypeBase,
     TypeCategory,
@@ -87,14 +88,14 @@ export class PackageTypeVerifier {
 
         // Make sure we have a default python platform and version.
         // Allow the command-line parameters to override the normal defaults.
-        if (commandLineOptions.pythonPlatform) {
-            this._configOptions.defaultPythonPlatform = commandLineOptions.pythonPlatform;
+        if (commandLineOptions.configSettings.pythonPlatform) {
+            this._configOptions.defaultPythonPlatform = commandLineOptions.configSettings.pythonPlatform;
         } else {
             this._configOptions.ensureDefaultPythonPlatform(host, console);
         }
 
-        if (commandLineOptions.pythonVersion) {
-            this._configOptions.defaultPythonVersion = commandLineOptions.pythonVersion;
+        if (commandLineOptions.configSettings.pythonVersion) {
+            this._configOptions.defaultPythonVersion = commandLineOptions.configSettings.pythonVersion;
         } else {
             this._configOptions.ensureDefaultPythonVersion(host, console);
         }
@@ -764,7 +765,7 @@ export class PackageTypeVerifier {
                 if (isUnknown(typeArg)) {
                     this._addSymbolError(
                         symbolInfo,
-                        `Type argument ${index + 1} for type alias "${aliasInfo!.name}" has unknown type`,
+                        `Type argument ${index + 1} for type alias "${aliasInfo!.shared.name}" has unknown type`,
                         declRange,
                         declFileUri
                     );
@@ -772,7 +773,9 @@ export class PackageTypeVerifier {
                 } else if (isPartlyUnknown(typeArg)) {
                     this._addSymbolError(
                         symbolInfo,
-                        `Type argument ${index + 1} for type alias "${aliasInfo!.name}" has partially unknown type`,
+                        `Type argument ${index + 1} for type alias "${
+                            aliasInfo!.shared.name
+                        }" has partially unknown type`,
                         declRange,
                         declFileUri
                     );
@@ -831,8 +834,8 @@ export class PackageTypeVerifier {
                 break;
             }
 
-            case TypeCategory.OverloadedFunction: {
-                for (const overload of type.priv.overloads) {
+            case TypeCategory.Overloaded: {
+                for (const overload of OverloadedType.getOverloads(type)) {
                     knownStatus = this._updateKnownStatusIfWorse(
                         knownStatus,
                         this._getSymbolTypeKnownStatus(
@@ -1307,11 +1310,15 @@ export class PackageTypeVerifier {
         if (aliasInfo?.typeArgs) {
             aliasInfo.typeArgs.forEach((typeArg, index) => {
                 if (isUnknown(typeArg)) {
-                    diag.addMessage(`Type argument ${index + 1} for type alias "${aliasInfo!.name}" has unknown type`);
+                    diag.addMessage(
+                        `Type argument ${index + 1} for type alias "${aliasInfo!.shared.name}" has unknown type`
+                    );
                     knownStatus = this._updateKnownStatusIfWorse(knownStatus, TypeKnownStatus.Unknown);
                 } else if (isPartlyUnknown(typeArg)) {
                     diag.addMessage(
-                        `Type argument ${index + 1} for type alias "${aliasInfo!.name}" has partially unknown type`
+                        `Type argument ${index + 1} for type alias "${
+                            aliasInfo!.shared.name
+                        }" has partially unknown type`
                     );
                     knownStatus = this._updateKnownStatusIfWorse(knownStatus, TypeKnownStatus.PartiallyUnknown);
                 }
@@ -1345,8 +1352,8 @@ export class PackageTypeVerifier {
                 break;
             }
 
-            case TypeCategory.OverloadedFunction: {
-                for (const overload of type.priv.overloads) {
+            case TypeCategory.Overloaded: {
+                for (const overload of OverloadedType.getOverloads(type)) {
                     knownStatus = this._updateKnownStatusIfWorse(
                         knownStatus,
                         this._getTypeKnownStatus(report, overload, publicSymbols, diag.createAddendum())
@@ -1424,7 +1431,7 @@ export class PackageTypeVerifier {
 
         switch (type.category) {
             case TypeCategory.Function:
-            case TypeCategory.OverloadedFunction: {
+            case TypeCategory.Overloaded: {
                 const funcDecl = symbol
                     .getDeclarations()
                     .find((decl) => decl.type === DeclarationType.Function) as FunctionDeclaration;

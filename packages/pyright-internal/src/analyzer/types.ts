@@ -7,48 +7,42 @@
  * Representation of types used during type analysis within Python.
  */
 
+import { partition } from '../common/collectionUtils';
 import { assert } from '../common/debug';
 import { Uri } from '../common/uri/uri';
-import { ArgumentNode, NameNode, ParamCategory } from '../parser/parseNodes';
+import { ArgumentNode, ExpressionNode, NameNode, ParamCategory, TypeAnnotationNode } from '../parser/parseNodes';
 import { ClassDeclaration, FunctionDeclaration, SpecialBuiltInClassDeclaration } from './declaration';
 import { Symbol, SymbolTable } from './symbol';
-import { getTypeVarScopeId } from './typeUtils';
 
 export const enum TypeCategory {
-    // Name is not bound to a value of any type.
+    // Name is not bound to a value of any type
     Unbound,
 
-    // Type exists but is not currently known by the
-    // type analyzer (e.g. there is no available typings file).
-    // Unknown types are treated the same as "Any" at analysis time.
+    // Implicit Any type
     Unknown,
 
-    // Type can be anything.
+    // Type can be anything
     Any,
 
-    // Used in type narrowing to indicate that all possible
-    // subtypes in a union have been eliminated, and execution
-    // should never get to this point.
+    // The bottom type, equivalent to an empty union
     Never,
 
-    // Callable type with typed input parameters and return parameter.
+    // Callable type
     Function,
 
-    // Functions defined with @overload decorator in stub files that
-    // have multiple function declarations for a common implementation.
-    OverloadedFunction,
+    // Functions defined with @overload decorator
+    Overloaded,
 
-    // Class definition, including associated instance methods,
-    // class methods, static methods, properties, and variables.
+    // Class definition
     Class,
 
-    // Module instance.
+    // Module instance
     Module,
 
-    // Composite type (e.g. Number OR String).
+    // Union of two or more other types
     Union,
 
-    // Type variable (defined with TypeVar)
+    // Type variable
     TypeVar,
 }
 
@@ -75,16 +69,20 @@ export type UnionableType =
     | UnknownType
     | AnyType
     | FunctionType
-    | OverloadedFunctionType
+    | OverloadedType
     | ClassType
     | ModuleType
     | TypeVarType;
 
 export type Type = UnionableType | NeverType | UnionType;
 
+// A string that uniquely identifies a TypeVar that is bound to a scope
+// (a generic class, function, or type alias).
 export type TypeVarScopeId = string;
-export const UnificationScopeId = '-';
+export const UnificationScopeId: TypeVarScopeId = '-';
 
+// Information about an enum member that can be used within a Literal
+// type annotation.
 export class EnumLiteral {
     constructor(
         public classFullName: string,
@@ -114,15 +112,18 @@ export const maxTypeRecursionCount = 20;
 
 export type InheritanceChain = (ClassType | UnknownType)[];
 
+// Options used with the isTypeSame function
 export interface TypeSameOptions {
     ignorePseudoGeneric?: boolean;
     ignoreTypeFlags?: boolean;
     ignoreConditions?: boolean;
     ignoreTypedDictNarrowEntries?: boolean;
+    honorTypeForm?: boolean;
+    honorIsTypeArgExplicit?: boolean;
     treatAnySameAsUnknown?: boolean;
 }
 
-export interface TypeAliasInfo {
+export interface TypeAliasSharedInfo {
     name: string;
     fullName: string;
     moduleName: string;
@@ -140,7 +141,11 @@ export interface TypeAliasInfo {
 
     // Lazily-evaluated variance of type parameters based on how
     // they are used in the type alias
-    usageVariance: Variance[] | undefined;
+    computedVariance: Variance[] | undefined;
+}
+
+export interface TypeAliasInfo {
+    shared: TypeAliasSharedInfo;
 
     // Type argument, if type alias is specialized
     typeArgs: Type[] | undefined;
@@ -163,17 +168,21 @@ interface CachedTypeInfo {
 export interface TypeBaseProps {
     // Used to handle nested references to instantiable classes
     // (e.g. type[type[type[T]]]). If the field isn't present,
-    // it is assumed to be zero.
+    // it is assumed to be zero
     instantiableDepth: number | undefined;
 
     // Used in cases where the type is a special form when used in a
-    // value expression such as UnionType, Literal, or Required.
+    // value expression such as UnionType, Literal, or Required
     specialForm: ClassType | undefined;
+
+    // Used for "type form" objects, the evaluated form
+    // of a type expression in a value expression context
+    typeForm: Type | undefined;
 
     // Used only for type aliases
     typeAliasInfo: TypeAliasInfo | undefined;
 
-    // Used only for conditional (constrained) types
+    // Used only for types that are conditioned on a TypeVar
     condition: TypeCondition[] | undefined;
 }
 
@@ -216,11 +225,16 @@ export namespace TypeBase {
             type.props = {
                 instantiableDepth: undefined,
                 specialForm: undefined,
+                typeForm: undefined,
                 typeAliasInfo: undefined,
                 condition: undefined,
             };
         }
         return type.props;
+    }
+
+    export function getInstantiableDepth(type: TypeBase<any>) {
+        return type.props?.instantiableDepth ?? 0;
     }
 
     export function setSpecialForm(type: TypeBase<any>, specialForm: ClassType | undefined) {
@@ -233,6 +247,10 @@ export namespace TypeBase {
 
     export function setTypeAliasInfo(type: TypeBase<any>, typeAliasInfo: TypeAliasInfo | undefined) {
         TypeBase.addProps(type).typeAliasInfo = typeAliasInfo;
+    }
+
+    export function setTypeForm(type: TypeBase<any>, typeForm: Type | undefined) {
+        TypeBase.addProps(type).typeForm = typeForm;
     }
 
     export function setCondition(type: TypeBase<any>, condition: TypeCondition[] | undefined) {
@@ -261,6 +279,11 @@ export namespace TypeBase {
         assert(TypeBase.isInstantiable(type));
 
         const newInstance = TypeBase.cloneType(type);
+
+        // Remove type form information from the type.
+        if (newInstance.props?.typeForm) {
+            TypeBase.setTypeForm(newInstance, undefined);
+        }
 
         const depth = newInstance.props?.instantiableDepth;
         if (depth === undefined) {
@@ -301,6 +324,11 @@ export namespace TypeBase {
             TypeBase.setTypeAliasInfo(newInstance, undefined);
         }
 
+        // Remove type form information from the type.
+        if (newInstance.props?.typeForm) {
+            TypeBase.setTypeForm(newInstance, undefined);
+        }
+
         // Should we cache it for next time?
         if (cache) {
             if (!type.cached) {
@@ -313,10 +341,18 @@ export namespace TypeBase {
         return newInstance;
     }
 
-    export function cloneForTypeAlias(type: Type, aliasInfo: TypeAliasInfo): Type {
+    export function cloneForTypeAlias<T extends Type>(type: T, aliasInfo: TypeAliasInfo): T {
         const typeClone = cloneType(type);
 
         TypeBase.setTypeAliasInfo(typeClone, aliasInfo);
+
+        return typeClone;
+    }
+
+    export function cloneWithTypeForm<T extends Type>(type: T, typeForm: Type | undefined): T {
+        const typeClone = cloneType(type);
+
+        TypeBase.setTypeForm(typeClone, typeForm);
 
         return typeClone;
     }
@@ -506,7 +542,10 @@ export interface DataClassEntry {
     isKeywordOnly: boolean;
     alias?: string | undefined;
     hasDefault?: boolean | undefined;
+    isDefaultFactory?: boolean | undefined;
     nameNode: NameNode | undefined;
+    typeAnnotationNode: TypeAnnotationNode | undefined;
+    defaultExpr?: ExpressionNode | undefined;
     includeInInit: boolean;
     type: Type;
     converter?: ArgumentNode | undefined;
@@ -607,10 +646,6 @@ export const enum ClassTypeFlags {
     // Class is declared within a type stub file.
     DefinedInStub = 1 << 18,
 
-    // Class does not allow writing or deleting its instance variables
-    // through a member access. Used with named tuples.
-    ReadOnlyInstanceVariables = 1 << 19,
-
     // Decorated with @type_check_only.
     TypeCheckOnly = 1 << 20,
 
@@ -660,7 +695,9 @@ interface ClassDetailsShared {
     docString?: string | undefined;
     dataClassEntries?: DataClassEntry[] | undefined;
     dataClassBehaviors?: DataClassBehaviors | undefined;
+    namedTupleEntries?: Set<string> | undefined;
     typedDictEntries?: TypedDictEntries | undefined;
+    typedDictExtraItemsExpr?: ExpressionNode | undefined;
     localSlotsNames?: string[];
 
     // If the class is decorated with a @deprecated decorator, this
@@ -792,6 +829,9 @@ export interface ClassDetailsPriv {
     // the "deprecated" class. This allows these instances to be used
     // as decorators for other classes or functions.
     deprecatedInstanceMessage?: string | undefined;
+
+    // Special-case fields for partial class.
+    partialCallType?: Type | undefined;
 }
 
 export interface ClassType extends TypeBase<TypeCategory.Class> {
@@ -966,18 +1006,29 @@ export namespace ClassType {
         return newClassType;
     }
 
-    export function cloneForSymbolTableUpdate(classType: ClassType): ClassType {
+    export function cloneForPartial(classType: ClassType, partialCallType: Type): ClassType {
         const newClassType = TypeBase.cloneType(classType);
-        newClassType.shared = { ...newClassType.shared };
-        newClassType.shared.fields = new Map(newClassType.shared.fields);
-        newClassType.shared.mro = Array.from(newClassType.shared.mro);
-        newClassType.shared.mro[0] = cloneAsInstantiable(newClassType);
+        newClassType.priv.partialCallType = partialCallType;
         return newClassType;
     }
 
-    export function cloneForUnpacked(classType: ClassType, isUnpacked = true): ClassType {
+    export function cloneForUnpacked(classType: ClassType): ClassType {
+        if (classType.priv.isUnpacked) {
+            return classType;
+        }
+
         const newClassType = TypeBase.cloneType(classType);
-        newClassType.priv.isUnpacked = isUnpacked;
+        newClassType.priv.isUnpacked = true;
+        return newClassType;
+    }
+
+    export function cloneForPacked(classType: ClassType): ClassType {
+        if (!classType.priv.isUnpacked) {
+            return classType;
+        }
+
+        const newClassType = TypeBase.cloneType(classType);
+        newClassType.priv.isUnpacked = false;
         return newClassType;
     }
 
@@ -1225,10 +1276,6 @@ export namespace ClassType {
         return !!(classType.shared.flags & ClassTypeFlags.TupleClass);
     }
 
-    export function isReadOnlyInstanceVariables(classType: ClassType) {
-        return !!(classType.shared.flags & ClassTypeFlags.ReadOnlyInstanceVariables);
-    }
-
     export function getTypeParams(classType: ClassType) {
         return classType.shared.typeParams;
     }
@@ -1263,9 +1310,25 @@ export namespace ClassType {
         );
     }
 
+    export function hasNamedTupleEntry(classType: ClassType, name: string): boolean {
+        if (!classType.shared.namedTupleEntries) {
+            return false;
+        }
+
+        return classType.shared.namedTupleEntries.has(name);
+    }
+
     // Same as isTypeSame except that it doesn't compare type arguments.
     export function isSameGenericClass(classType: ClassType, type2: ClassType, recursionCount = 0) {
         if (!classType.priv.isTypedDictPartial !== !type2.priv.isTypedDictPartial) {
+            return false;
+        }
+
+        if (TypeBase.isInstance(classType) !== TypeBase.isInstance(type2)) {
+            return false;
+        }
+
+        if (TypeBase.getInstantiableDepth(classType) !== TypeBase.getInstantiableDepth(type2)) {
             return false;
         }
 
@@ -1437,13 +1500,15 @@ export interface FunctionParam {
     flags: FunctionParamFlags;
     name: string | undefined;
 
-    // Use getEffectiveParamType to access this field.
+    // Use getParamType to access this field.
     // eslint-disable-next-line @typescript-eslint/naming-convention
     _type: Type;
 
-    // Use getEffectiveParamDefaultArgType to access this field.
+    // Use getParamDefaultType to access this field.
     // eslint-disable-next-line @typescript-eslint/naming-convention
     _defaultType: Type | undefined;
+
+    defaultExpr: ExpressionNode | undefined;
 }
 
 export namespace FunctionParam {
@@ -1452,9 +1517,10 @@ export namespace FunctionParam {
         type: Type,
         flags = FunctionParamFlags.None,
         name?: string,
-        defaultType?: Type
+        defaultType?: Type,
+        defaultExpr?: ExpressionNode
     ): FunctionParam {
-        return { category, flags, name, _type: type, _defaultType: defaultType };
+        return { category, flags, name, _type: type, _defaultType: defaultType, defaultExpr };
     }
 
     export function isNameSynthesized(param: FunctionParam) {
@@ -1598,7 +1664,7 @@ export interface CallSiteInferenceTypeCacheEntry {
 }
 
 export interface SignatureWithOffsets {
-    type: FunctionType | OverloadedFunctionType;
+    type: FunctionType | OverloadedType;
     expressionOffsets: number[];
 }
 
@@ -1632,7 +1698,7 @@ export interface FunctionDetailsPriv {
 
     // If this function is part of an overloaded function, this
     // refers back to the overloaded function type.
-    overloaded?: OverloadedFunctionType;
+    overloaded?: OverloadedType;
 
     // If this function is created with a "Callable" annotation with
     // type arguments? This allows us to detect and report an error
@@ -1708,7 +1774,7 @@ export namespace FunctionType {
 
         if (boundToType) {
             if (type.shared.name === '__new__' || type.shared.name === '__init__') {
-                newFunction.priv.constructorTypeVarScopeId = getTypeVarScopeId(boundToType);
+                newFunction.priv.constructorTypeVarScopeId = boundToType.shared.typeVarScopeId;
             }
         }
 
@@ -1817,7 +1883,8 @@ export namespace FunctionType {
                     FunctionType.getParamType(paramSpecValue, index),
                     (param.flags & FunctionParamFlags.NameSynthesized) | FunctionParamFlags.TypeDeclared,
                     param.name,
-                    FunctionType.getParamDefaultType(paramSpecValue, index)
+                    FunctionType.getParamDefaultType(paramSpecValue, index),
+                    param.defaultExpr
                 );
             }),
         ];
@@ -2251,46 +2318,55 @@ export namespace FunctionType {
     }
 }
 
-export interface OverloadedFunctionDetailsPriv {
-    overloads: FunctionType[];
+export interface OverloadedDetailsPriv {
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    _overloads: FunctionType[];
+
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    _implementation: Type | undefined;
 }
 
-export interface OverloadedFunctionType extends TypeBase<TypeCategory.OverloadedFunction> {
-    priv: OverloadedFunctionDetailsPriv;
+export interface OverloadedType extends TypeBase<TypeCategory.Overloaded> {
+    priv: OverloadedDetailsPriv;
 }
 
-export namespace OverloadedFunctionType {
-    export function create(overloads: FunctionType[]) {
-        const newType: OverloadedFunctionType = {
-            category: TypeCategory.OverloadedFunction,
+export namespace OverloadedType {
+    export function create(overloads: FunctionType[], implementation?: Type): OverloadedType {
+        const newType: OverloadedType = {
+            category: TypeCategory.Overloaded,
             flags: TypeFlags.Instance,
             props: undefined,
             cached: undefined,
             shared: undefined,
             priv: {
-                overloads: [],
+                _overloads: [],
+                _implementation: implementation,
             },
         };
 
         overloads.forEach((overload) => {
-            OverloadedFunctionType.addOverload(newType, overload);
+            OverloadedType.addOverload(newType, overload);
         });
+
+        if (implementation && isFunction(implementation)) {
+            implementation.priv.overloaded = newType;
+        }
 
         return newType;
     }
 
     // Adds a new overload or an implementation.
-    export function addOverload(type: OverloadedFunctionType, functionType: FunctionType) {
+    export function addOverload(type: OverloadedType, functionType: FunctionType) {
         functionType.priv.overloaded = type;
-        type.priv.overloads.push(functionType);
+        type.priv._overloads.push(functionType);
     }
 
-    export function getOverloads(type: OverloadedFunctionType): FunctionType[] {
-        return type.priv.overloads.filter((func) => FunctionType.isOverloaded(func));
+    export function getOverloads(type: OverloadedType): FunctionType[] {
+        return type.priv._overloads;
     }
 
-    export function getImplementation(type: OverloadedFunctionType): FunctionType | undefined {
-        return type.priv.overloads.find((func) => !FunctionType.isOverloaded(func));
+    export function getImplementation(type: OverloadedType): Type | undefined {
+        return type.priv._implementation;
     }
 }
 
@@ -2330,8 +2406,8 @@ export namespace NeverType {
     }
 
     export function convertToInstance(type: NeverType): NeverType {
-        // Remove the "special form" if present. Otherwise return the existing type.
-        if (!type.props?.specialForm) {
+        // Remove the specialForm or typeForm if present. Otherwise return the existing type.
+        if (!type.props?.specialForm && !type.props?.typeForm) {
             return type;
         }
 
@@ -2578,6 +2654,7 @@ export namespace UnionType {
     export function containsType(
         unionType: UnionType,
         subtype: Type,
+        options: TypeSameOptions = {},
         exclusionSet?: Set<number>,
         recursionCount = 0
     ): boolean {
@@ -2603,7 +2680,7 @@ export namespace UnionType {
                 return false;
             }
 
-            return isTypeSame(t, subtype, {}, recursionCount);
+            return isTypeSame(t, subtype, options, recursionCount);
         });
 
         if (foundIndex < 0) {
@@ -2677,7 +2754,7 @@ export interface TypeVarDetailsShared {
     isTypeParamSyntax: boolean;
 
     // Information about recursive type aliases.
-    recursiveAlias: RecursiveAliasInfo | undefined;
+    recursiveAlias: TypeAliasSharedInfo | undefined;
 }
 
 export type ParamSpecAccess = 'args' | 'kwargs';
@@ -2716,6 +2793,9 @@ export interface TypeVarDetailsPriv {
     // If the TypeVar is bound form of a TypeVar, this refers to
     // the corresponding free TypeVar.
     freeTypeVar?: TypeVarType | undefined;
+
+    // Is this TypeVar or TypeVarTuple unpacked (i.e. Unpack or * operator applied)?
+    isUnpacked?: boolean | undefined;
 }
 
 export interface TypeVarType extends TypeBase<TypeCategory.TypeVar> {
@@ -2750,9 +2830,6 @@ export namespace ParamSpecType {
 }
 
 export interface TypeVarTupleDetailsPriv extends TypeVarDetailsPriv {
-    // Is this TypeVarTuple unpacked (i.e. Unpack or * operator applied)?
-    isUnpacked?: boolean | undefined;
-
     // Is this TypeVarTuple included in a Union[]? This allows us to
     // differentiate between Unpack[Vs] and Union[Unpack[Vs]].
     isInUnion?: boolean | undefined;
@@ -2813,7 +2890,11 @@ export namespace TypeVarType {
         newInstance.shared.name = name;
 
         if (newInstance.priv.scopeId) {
-            newInstance.priv.nameWithScope = makeNameWithScope(name, newInstance.priv.scopeId);
+            newInstance.priv.nameWithScope = makeNameWithScope(
+                name,
+                newInstance.priv.scopeId,
+                newInstance.priv.scopeName ?? ''
+            );
         }
 
         return newInstance;
@@ -2826,17 +2907,20 @@ export namespace TypeVarType {
         scopeType: TypeVarScopeType | undefined
     ): TypeVarType {
         const newInstance = TypeBase.cloneType(type);
-        newInstance.priv.nameWithScope = makeNameWithScope(type.shared.name, scopeId);
+        newInstance.priv.nameWithScope = makeNameWithScope(type.shared.name, scopeId, scopeName ?? '');
         newInstance.priv.scopeId = scopeId;
         newInstance.priv.scopeName = scopeName;
         newInstance.priv.scopeType = scopeType;
         return newInstance;
     }
 
-    export function cloneForUnpacked(type: TypeVarTupleType, isInUnion = false) {
+    export function cloneForUnpacked(type: TypeVarType, isInUnion = false) {
         const newInstance = TypeBase.cloneType(type);
         newInstance.priv.isUnpacked = true;
-        newInstance.priv.isInUnion = isInUnion;
+
+        if (isTypeVarTuple(newInstance) && isInUnion) {
+            newInstance.priv.isInUnion = isInUnion;
+        }
 
         if (newInstance.priv.freeTypeVar) {
             newInstance.priv.freeTypeVar = TypeVarType.cloneForUnpacked(newInstance.priv.freeTypeVar, isInUnion);
@@ -2844,10 +2928,13 @@ export namespace TypeVarType {
         return newInstance;
     }
 
-    export function cloneForPacked(type: TypeVarTupleType) {
+    export function cloneForPacked(type: TypeVarType) {
         const newInstance = TypeBase.cloneType(type);
         newInstance.priv.isUnpacked = false;
-        newInstance.priv.isInUnion = false;
+
+        if (isTypeVarTuple(newInstance)) {
+            newInstance.priv.isInUnion = false;
+        }
 
         if (newInstance.priv.freeTypeVar) {
             newInstance.priv.freeTypeVar = TypeVarType.cloneForPacked(newInstance.priv.freeTypeVar);
@@ -2916,8 +3003,18 @@ export namespace TypeVarType {
         return newInstance;
     }
 
-    export function makeNameWithScope(name: string, scopeId: string) {
-        return `${name}.${scopeId}`;
+    export function cloneWithComputedVariance(type: TypeVarType, computedVariance: Variance): TypeVarType {
+        const newInstance = TypeBase.cloneType(type);
+        newInstance.priv.computedVariance = computedVariance;
+        return newInstance;
+    }
+
+    export function makeNameWithScope(name: string, scopeId: string, scopeName: string) {
+        // We include the scopeName here even though it's normally already part
+        // of the scopeId. There are cases where it can diverge, specifically
+        // in scenarios involving higher-order functions that return generic
+        // callable types. See adjustCallableReturnType for details.
+        return `${name}.${scopeId}.${scopeName}`;
     }
 
     // When solving the TypeVars for a callable, we need to distinguish between
@@ -3001,8 +3098,8 @@ export namespace TypeVarType {
         return typeVarType.priv.nameWithScope || typeVarType.shared.name;
     }
 
-    export function getReadableName(type: TypeVarType) {
-        if (type.priv.scopeName) {
+    export function getReadableName(type: TypeVarType, includeScope = true) {
+        if (type.priv.scopeName && includeScope) {
             return `${type.shared.name}@${type.priv.scopeName}`;
         }
 
@@ -3119,6 +3216,10 @@ export function isUnpackedTypeVarTuple(type: Type): type is TypeVarTupleType {
     return isTypeVarTuple(type) && !!type.priv.isUnpacked && !type.priv.isInUnion;
 }
 
+export function isUnpackedTypeVar(type: Type): type is TypeVarTupleType {
+    return isTypeVar(type) && !isTypeVarTuple(type) && !!type.priv.isUnpacked;
+}
+
 export function isUnpackedClass(type: Type): type is ClassType {
     if (!isClass(type) || !type.priv.isUnpacked) {
         return false;
@@ -3128,15 +3229,15 @@ export function isUnpackedClass(type: Type): type is ClassType {
 }
 
 export function isUnpacked(type: Type): boolean {
-    return isUnpackedTypeVarTuple(type) || isUnpackedClass(type);
+    return isUnpackedTypeVarTuple(type) || isUnpackedTypeVar(type) || isUnpackedClass(type);
 }
 
 export function isFunction(type: Type): type is FunctionType {
     return type.category === TypeCategory.Function;
 }
 
-export function isOverloadedFunction(type: Type): type is OverloadedFunctionType {
-    return type.category === TypeCategory.OverloadedFunction;
+export function isOverloaded(type: Type): type is OverloadedType {
+    return type.category === TypeCategory.Overloaded;
 }
 
 export function getTypeAliasInfo(type: Type) {
@@ -3187,6 +3288,23 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
         return true;
     }
     recursionCount++;
+
+    if (options.honorTypeForm) {
+        const typeForm1 = type1.props?.typeForm;
+        const typeForm2 = type2.props?.typeForm;
+
+        if (typeForm1) {
+            if (!typeForm2) {
+                return false;
+            }
+
+            if (!isTypeSame(typeForm1, typeForm2, options, recursionCount)) {
+                return false;
+            }
+        } else if (typeForm2) {
+            return false;
+        }
+    }
 
     switch (type1.category) {
         case TypeCategory.Class: {
@@ -3247,8 +3365,18 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
                 return false;
             }
 
+            if (!type1.priv.isUnpacked !== !classType2.priv.isUnpacked) {
+                return false;
+            }
+
             if (!type1.priv.isTypedDictPartial !== !classType2.priv.isTypedDictPartial) {
                 return false;
+            }
+
+            if (options.honorIsTypeArgExplicit) {
+                if (!!type1.priv.isTypeArgExplicit !== !!classType2.priv.isTypeArgExplicit) {
+                    return false;
+                }
             }
 
             if (!options.ignoreTypedDictNarrowEntries && !ClassType.isTypedDictNarrowedEntriesSame(type1, classType2)) {
@@ -3339,17 +3467,17 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
             return true;
         }
 
-        case TypeCategory.OverloadedFunction: {
+        case TypeCategory.Overloaded: {
             // Make sure the overload counts match.
-            const functionType2 = type2 as OverloadedFunctionType;
-            if (type1.priv.overloads.length !== functionType2.priv.overloads.length) {
+            const functionType2 = type2 as OverloadedType;
+            if (type1.priv._overloads.length !== functionType2.priv._overloads.length) {
                 return false;
             }
 
             // We assume here that overloaded functions always appear
             // in the same order from one analysis pass to another.
-            for (let i = 0; i < type1.priv.overloads.length; i++) {
-                if (!isTypeSame(type1.priv.overloads[i], functionType2.priv.overloads[i], options, recursionCount)) {
+            for (let i = 0; i < type1.priv._overloads.length; i++) {
+                if (!isTypeSame(type1.priv._overloads[i], functionType2.priv._overloads[i], options, recursionCount)) {
                     return false;
                 }
             }
@@ -3372,7 +3500,7 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
             return (
                 findSubtype(
                     type1,
-                    (subtype) => !UnionType.containsType(unionType2, subtype, exclusionSet, recursionCount)
+                    (subtype) => !UnionType.containsType(unionType2, subtype, options, exclusionSet, recursionCount)
                 ) === undefined
             );
         }
@@ -3381,6 +3509,10 @@ export function isTypeSame(type1: Type, type2: Type, options: TypeSameOptions = 
             const type2TypeVar = type2 as TypeVarType;
 
             if (type1.priv.scopeId !== type2TypeVar.priv.scopeId) {
+                return false;
+            }
+
+            if (type1.priv.nameWithScope !== type2TypeVar.priv.nameWithScope) {
                 return false;
             }
 
@@ -3556,19 +3688,19 @@ export interface CombineTypesOptions {
 // are combined into a UnionType. NeverTypes are filtered out.
 // If no types remain in the end, a NeverType is returned.
 export function combineTypes(subtypes: Type[], options?: CombineTypesOptions): Type {
-    // Filter out any "Never" and "NoReturn" types.
-    let sawNoReturn = false;
+    let neverTypes: NeverType[];
 
-    if (subtypes.some((subtype) => subtype.category === TypeCategory.Never))
-        subtypes = subtypes.filter((subtype) => {
-            if (subtype.category === TypeCategory.Never && subtype.priv.isNoReturn) {
-                sawNoReturn = true;
-            }
-            return subtype.category !== TypeCategory.Never;
-        });
+    // Filter out any Never or NoReturn types.
+    [neverTypes, subtypes] = partition<Type, NeverType>(subtypes, isNever);
 
     if (subtypes.length === 0) {
-        return sawNoReturn ? NeverType.createNoReturn() : NeverType.createNever();
+        if (neverTypes.length > 0) {
+            // Prefer NoReturn over Never. This approach preserves type alias
+            // information if present.
+            return neverTypes.find((t) => t.priv.isNoReturn) ?? neverTypes[0];
+        }
+
+        return NeverType.createNever();
     }
 
     // Handle the common case where there is only one type.
@@ -3739,7 +3871,7 @@ function _addTypeIfUnique(unionType: UnionType, typeToAdd: UnionableType, elideR
         const type = unionType.priv.subtypes[i];
 
         // Does this type already exist in the types array?
-        if (isTypeSame(type, typeToAdd)) {
+        if (isTypeSame(type, typeToAdd, { honorTypeForm: true })) {
             return;
         }
 
@@ -3750,7 +3882,7 @@ function _addTypeIfUnique(unionType: UnionType, typeToAdd: UnionableType, elideR
         // we can hit recursive cases (where a pseudo-generic class is
         // parameterized with its own class) ad infinitum.
         if (isPseudoGeneric) {
-            if (isTypeSame(type, typeToAdd, { ignorePseudoGeneric: true })) {
+            if (isTypeSame(type, typeToAdd, { ignorePseudoGeneric: true, honorTypeForm: true })) {
                 unionType.priv.subtypes[i] = ClassType.specialize(
                     typeToAdd,
                     typeToAdd.shared.typeParams.map(() => UnknownType.create())

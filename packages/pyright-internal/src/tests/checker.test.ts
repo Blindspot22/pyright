@@ -87,7 +87,7 @@ test('AbstractClass4', () => {
 test('AbstractClass5', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['abstractClass5.py']);
 
-    TestUtils.validateResults(analysisResults, 2);
+    TestUtils.validateResults(analysisResults, 3);
 });
 
 test('AbstractClass6', () => {
@@ -118,6 +118,12 @@ test('AbstractClass10', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['abstractClass10.py']);
 
     TestUtils.validateResults(analysisResults, 6);
+});
+
+test('AbstractClass11', () => {
+    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['abstractClass11.py']);
+
+    TestUtils.validateResults(analysisResults, 2);
 });
 
 test('Constants1', () => {
@@ -239,6 +245,18 @@ test('UnnecessaryIsInstance1', () => {
     configOptions.diagnosticRuleSet.reportUnnecessaryIsInstance = 'error';
     analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryIsInstance1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 5);
+});
+
+test('UnnecessaryIsInstance2', () => {
+    const configOptions = new ConfigOptions(Uri.empty());
+
+    let analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryIsInstance2.py'], configOptions);
+    TestUtils.validateResults(analysisResults, 0);
+
+    // Turn on errors.
+    configOptions.diagnosticRuleSet.reportUnnecessaryIsInstance = 'error';
+    analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryIsInstance2.py'], configOptions);
+    TestUtils.validateResults(analysisResults, 2);
 });
 
 test('UnnecessaryIsSubclass1', () => {
@@ -377,7 +395,7 @@ test('ParamNames1', () => {
     const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['paramNames1.py'], configOptions);
-    TestUtils.validateResults(analysisResults, 0, 7);
+    TestUtils.validateResults(analysisResults, 0, 11);
 
     configOptions.diagnosticRuleSet.reportSelfClsParameterName = 'none';
     analysisResults = TestUtils.typeAnalyzeSampleFiles(['paramNames1.py'], configOptions);
@@ -385,7 +403,7 @@ test('ParamNames1', () => {
 
     configOptions.diagnosticRuleSet.reportSelfClsParameterName = 'error';
     analysisResults = TestUtils.typeAnalyzeSampleFiles(['paramNames1.py'], configOptions);
-    TestUtils.validateResults(analysisResults, 7, 0);
+    TestUtils.validateResults(analysisResults, 11, 0);
 });
 
 test('ParamType1', () => {
@@ -396,7 +414,7 @@ test('ParamType1', () => {
 test('Python2', () => {
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['python2.py']);
 
-    TestUtils.validateResults(analysisResults, 6);
+    TestUtils.validateResults(analysisResults, 7);
 });
 
 test('InconsistentSpaceTab1', () => {

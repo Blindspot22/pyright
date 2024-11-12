@@ -18,7 +18,7 @@ import { DeclarationType } from './declaration';
 import { assignProperty } from './properties';
 import { Symbol } from './symbol';
 import { getLastTypedDeclarationForSymbol, isEffectivelyClassVar } from './symbolUtils';
-import { TypeEvaluator } from './typeEvaluatorTypes';
+import { AssignTypeFlags, TypeEvaluator } from './typeEvaluatorTypes';
 import {
     ClassType,
     FunctionType,
@@ -26,10 +26,10 @@ import {
     isClassInstance,
     isFunction,
     isInstantiableClass,
-    isOverloadedFunction,
+    isOverloaded,
     isTypeSame,
     ModuleType,
-    OverloadedFunctionType,
+    OverloadedType,
     Type,
     TypeBase,
     TypeVarType,
@@ -39,13 +39,15 @@ import {
 import {
     addSolutionForSelfType,
     applySolvedTypeVars,
-    AssignTypeFlags,
     ClassMember,
     containsLiteralType,
     lookUpClassMember,
+    makeFunctionTypeVarsBound,
     MemberAccessFlags,
     partiallySpecializeType,
     requiresSpecialization,
+    requiresTypeArgs,
+    selfSpecializeClass,
     synthesizeTypeVarForSelfCls,
 } from './typeUtils';
 
@@ -55,10 +57,16 @@ interface ProtocolAssignmentStackEntry {
 }
 
 interface ProtocolCompatibility {
-    srcType: Type;
-    destType: Type;
+    // Specialized source type or undefined if this entry applies
+    // to all specializations
+    srcType: ClassType | undefined;
+
+    // Specialized dest type
+    destType: ClassType;
+
     flags: AssignTypeFlags;
-    constraints: ConstraintTracker | undefined;
+    preConstraints: ConstraintTracker | undefined;
+    postConstraints: ConstraintTracker | undefined;
     isCompatible: boolean;
 }
 
@@ -72,8 +80,7 @@ export function assignClassToProtocol(
     destType: ClassType,
     srcType: ClassType,
     diag: DiagnosticAddendum | undefined,
-    destConstraints: ConstraintTracker | undefined,
-    srcConstraints: ConstraintTracker | undefined,
+    constraints: ConstraintTracker | undefined,
     flags: AssignTypeFlags,
     recursionCount: number
 ): boolean {
@@ -81,7 +88,13 @@ export function assignClassToProtocol(
     // srcType can be an instantiable class or a class instance.
     assert(isInstantiableClass(destType) && ClassType.isProtocolClass(destType));
 
-    const enforceInvariance = (flags & AssignTypeFlags.EnforceInvariance) !== 0;
+    // A literal source type should never affect protocol matching, so strip
+    // the literal type if it's present. This helps conserve on cache entries.
+    if (srcType.priv.literalValue !== undefined) {
+        srcType = evaluator.stripLiteralValue(srcType) as ClassType;
+    }
+
+    const enforceInvariance = (flags & AssignTypeFlags.Invariant) !== 0;
 
     // Use a stack of pending protocol class evaluations to detect recursion.
     // This can happen when a protocol class refers to itself.
@@ -94,46 +107,31 @@ export function assignClassToProtocol(
     }
 
     // See if we've already determined that this class is compatible with this protocol.
-    if (!enforceInvariance) {
-        const compatibility = getProtocolCompatibility(destType, srcType, flags, destConstraints);
+    const compat = getProtocolCompatibility(destType, srcType, flags, constraints);
 
-        if (compatibility !== undefined) {
-            if (compatibility) {
-                // If the caller has provided a destination type var context,
-                // we can't use the cached value unless the dest has no type
-                // parameters to solve.
-                if (!destConstraints || !requiresSpecialization(destType)) {
-                    return true;
-                }
+    if (compat !== undefined) {
+        if (compat.isCompatible) {
+            if (compat.postConstraints) {
+                constraints?.copyFromClone(compat.postConstraints);
             }
+            return true;
+        }
 
-            // If it's known not to be compatible and the caller hasn't requested
-            // any detailed diagnostic information or we've already exceeded the
-            // depth of diagnostic information that will be displayed, we can
-            // return false immediately.
-            if (!compatibility) {
-                if (!diag || diag.getNestLevel() > defaultMaxDiagnosticDepth) {
-                    return false;
-                }
-            }
+        // If it's known not to be compatible and the caller hasn't requested
+        // any detailed diagnostic information or we've already exceeded the
+        // depth of diagnostic information that will be displayed, we can
+        // return false immediately.
+        if (!diag || diag.getNestLevel() > defaultMaxDiagnosticDepth) {
+            return false;
         }
     }
 
     protocolAssignmentStack.push({ srcType, destType });
     let isCompatible = true;
-    const clonedConstraints = destConstraints?.clone();
+    const clonedConstraints = constraints?.clone();
 
     try {
-        isCompatible = assignClassToProtocolInternal(
-            evaluator,
-            destType,
-            srcType,
-            diag,
-            destConstraints,
-            srcConstraints,
-            flags,
-            recursionCount
-        );
+        isCompatible = assignToProtocolInternal(evaluator, destType, srcType, diag, constraints, flags, recursionCount);
     } catch (e) {
         // We'd normally use "finally" here, but the TS debugger does such
         // a poor job dealing with finally, we'll use a catch instead.
@@ -144,7 +142,18 @@ export function assignClassToProtocol(
     protocolAssignmentStack.pop();
 
     // Cache the results for next time.
-    setProtocolCompatibility(destType, srcType, flags, clonedConstraints, isCompatible);
+    if (!compat) {
+        setProtocolCompatibility(
+            evaluator,
+            destType,
+            srcType,
+            flags,
+            clonedConstraints,
+            constraints?.clone(),
+            isCompatible,
+            recursionCount
+        );
+    }
 
     return isCompatible;
 }
@@ -154,20 +163,11 @@ export function assignModuleToProtocol(
     destType: ClassType,
     srcType: ModuleType,
     diag: DiagnosticAddendum | undefined,
-    destConstraints: ConstraintTracker | undefined,
+    constraints: ConstraintTracker | undefined,
     flags: AssignTypeFlags,
     recursionCount: number
 ): boolean {
-    return assignClassToProtocolInternal(
-        evaluator,
-        destType,
-        srcType,
-        diag,
-        destConstraints,
-        /* srcConstraints */ undefined,
-        flags,
-        recursionCount
-    );
+    return assignToProtocolInternal(evaluator, destType, srcType, diag, constraints, flags, recursionCount);
 }
 
 // Determines whether the specified class is a protocol class that has
@@ -236,31 +236,47 @@ function getProtocolCompatibility(
     srcType: ClassType,
     flags: AssignTypeFlags,
     constraints: ConstraintTracker | undefined
-): boolean | undefined {
+): ProtocolCompatibility | undefined {
     const map = srcType.shared.protocolCompatibility as Map<string, ProtocolCompatibility[]> | undefined;
     const entries = map?.get(destType.shared.fullName);
     if (entries === undefined) {
         return undefined;
     }
 
-    const entry = entries.find((entry) => {
-        return (
-            isTypeSame(entry.destType, destType) &&
-            isTypeSame(entry.srcType, srcType) &&
-            entry.flags === flags &&
-            isConstraintTrackerSame(constraints, entry.constraints)
-        );
-    });
+    for (const entry of entries) {
+        if (entry.flags !== flags) {
+            continue;
+        }
 
-    return entry?.isCompatible;
+        if (entry.srcType === undefined) {
+            if (ClassType.isSameGenericClass(entry.destType, destType)) {
+                return entry;
+            }
+
+            continue;
+        }
+
+        if (
+            isTypeSame(entry.destType, destType, { honorIsTypeArgExplicit: true, honorTypeForm: true }) &&
+            isTypeSame(entry.srcType, srcType, { honorIsTypeArgExplicit: true, honorTypeForm: true }) &&
+            isConstraintTrackerSame(constraints, entry.preConstraints)
+        ) {
+            return entry;
+        }
+    }
+
+    return undefined;
 }
 
 function setProtocolCompatibility(
+    evaluator: TypeEvaluator,
     destType: ClassType,
     srcType: ClassType,
     flags: AssignTypeFlags,
-    constraints: ConstraintTracker | undefined,
-    isCompatible: boolean
+    preConstraints: ConstraintTracker | undefined,
+    postConstraints: ConstraintTracker | undefined,
+    isCompatible: boolean,
+    recursionCount: number
 ) {
     let map = srcType.shared.protocolCompatibility as Map<string, ProtocolCompatibility[]> | undefined;
     if (!map) {
@@ -274,14 +290,48 @@ function setProtocolCompatibility(
         map.set(destType.shared.fullName, entries);
     }
 
-    entries.push({
-        destType,
-        srcType,
-        flags,
-        constraints: constraints,
-        isCompatible,
-    });
+    // See if the srcType is always incompatible regardless of how it
+    // and the destType are specialized.
+    let isAlwaysIncompatible = false;
 
+    if (
+        !isCompatible &&
+        !entries.some((entry) => entry.flags === flags && ClassType.isSameGenericClass(entry.destType, destType))
+    ) {
+        const genericDestType = requiresTypeArgs(destType)
+            ? selfSpecializeClass(destType, { overrideTypeArgs: true })
+            : destType;
+        const genericSrcType = requiresTypeArgs(srcType)
+            ? selfSpecializeClass(srcType, { overrideTypeArgs: true })
+            : srcType;
+
+        if (
+            !assignToProtocolInternal(
+                evaluator,
+                genericDestType,
+                genericSrcType,
+                /* diag */ undefined,
+                /* constraints */ undefined,
+                flags,
+                recursionCount
+            )
+        ) {
+            isAlwaysIncompatible = true;
+        }
+    }
+
+    const newEntry: ProtocolCompatibility = {
+        destType,
+        srcType: isAlwaysIncompatible ? undefined : srcType,
+        flags,
+        preConstraints,
+        postConstraints,
+        isCompatible,
+    };
+
+    entries.push(newEntry);
+
+    // Make sure the cache doesn't grow too large.
     if (entries.length > maxProtocolCompatibilityCacheEntries) {
         entries.shift();
     }
@@ -295,24 +345,23 @@ function isConstraintTrackerSame(context1: ConstraintTracker | undefined, contex
     return context1.isSame(context2);
 }
 
-function assignClassToProtocolInternal(
+function assignToProtocolInternal(
     evaluator: TypeEvaluator,
     destType: ClassType,
     srcType: ClassType | ModuleType,
     diag: DiagnosticAddendum | undefined,
-    destConstraints: ConstraintTracker | undefined,
-    srcConstraints: ConstraintTracker | undefined,
+    constraints: ConstraintTracker | undefined,
     flags: AssignTypeFlags,
     recursionCount: number
 ): boolean {
-    if ((flags & AssignTypeFlags.EnforceInvariance) !== 0) {
+    if ((flags & AssignTypeFlags.Invariant) !== 0) {
         return isTypeSame(destType, srcType);
     }
 
     evaluator.inferVarianceForClass(destType);
 
     const sourceIsClassObject = isClass(srcType) && TypeBase.isInstantiable(srcType);
-    const protocolConstraints = createProtocolConstraints(evaluator, destType, destConstraints);
+    const protocolConstraints = createProtocolConstraints(evaluator, destType, constraints);
     const selfSolution = new ConstraintSolution();
 
     let selfType: ClassType | TypeVarType | undefined;
@@ -403,6 +452,7 @@ function assignClassToProtocolInternal(
 
             let srcMemberType: Type;
             let isSrcReadOnly = false;
+            let isDestReadOnly = false;
 
             if (isClass(srcType)) {
                 // Look in the metaclass first if we're treating the source as an instantiable class.
@@ -460,7 +510,7 @@ function assignClassToProtocolInternal(
                 }
 
                 // If the source is a method, bind it.
-                if (isFunction(srcMemberType) || isOverloadedFunction(srcMemberType)) {
+                if (isFunction(srcMemberType) || isOverloaded(srcMemberType)) {
                     if (isMemberFromMetaclass || isInstantiableClass(srcMemberInfo.classType)) {
                         let isInstanceMember = !srcMemberInfo.symbol.isClassMember();
 
@@ -500,8 +550,7 @@ function assignClassToProtocolInternal(
                     }
                 }
 
-                // Frozen dataclasses and named tuples should be treated as read-only.
-                if (ClassType.isDataClassFrozen(srcType) || ClassType.isReadOnlyInstanceVariables(srcType)) {
+                if (srcMemberInfo.isReadOnly) {
                     isSrcReadOnly = true;
                 }
             } else {
@@ -520,8 +569,11 @@ function assignClassToProtocolInternal(
             destMemberType = applySolvedTypeVars(destMemberType, selfSolution);
 
             // If the dest is a method, bind it.
-            if (isFunction(destMemberType) || isOverloadedFunction(destMemberType)) {
-                let boundDeclaredType: FunctionType | OverloadedFunctionType | undefined;
+            if (!destSymbol.isInstanceMember() && (isFunction(destMemberType) || isOverloaded(destMemberType))) {
+                let boundDeclaredType: FunctionType | OverloadedType | undefined;
+
+                // Functions are considered read-only.
+                isDestReadOnly = true;
 
                 if (isClass(srcType)) {
                     assert(srcMemberInfo);
@@ -550,6 +602,7 @@ function assignClassToProtocolInternal(
                 }
 
                 if (boundDeclaredType) {
+                    boundDeclaredType = makeFunctionTypeVarsBound(boundDeclaredType);
                     destMemberType = boundDeclaredType;
                 } else {
                     typesAreConsistent = false;
@@ -558,6 +611,21 @@ function assignClassToProtocolInternal(
             }
 
             const subDiag = diag?.createAddendum();
+
+            const isDestFinal = destSymbol
+                .getTypedDeclarations()
+                .some((decl) => decl.type === DeclarationType.Variable && !!decl.isFinal);
+            const isSrcFinal = srcSymbol
+                .getTypedDeclarations()
+                .some((decl) => decl.type === DeclarationType.Variable && !!decl.isFinal);
+
+            if (isSrcFinal) {
+                isSrcReadOnly = true;
+            }
+
+            if (isDestFinal) {
+                isDestReadOnly = true;
+            }
 
             // Properties require special processing.
             if (isClassInstance(destMemberType) && ClassType.isPropertyClass(destMemberType)) {
@@ -599,7 +667,6 @@ function assignClassToProtocolInternal(
                             srcMemberType,
                             subDiag?.createAddendum(),
                             protocolConstraints,
-                            /* srcConstraints */ undefined,
                             assignTypeFlags,
                             recursionCount
                         )
@@ -610,10 +677,17 @@ function assignClassToProtocolInternal(
                         typesAreConsistent = false;
                     }
 
+                    if (
+                        !lookUpClassMember(destMemberType, '__set__', MemberAccessFlags.SkipInstanceMembers) &&
+                        !lookUpClassMember(destMemberType, '__delete__', MemberAccessFlags.SkipInstanceMembers)
+                    ) {
+                        isDestReadOnly = true;
+                    }
+
                     if (isSrcReadOnly) {
                         // The source attribute is read-only. Make sure the setter
                         // is not defined in the dest property.
-                        if (lookUpClassMember(destMemberType, '__set__', MemberAccessFlags.SkipInstanceMembers)) {
+                        if (!isDestReadOnly) {
                             if (subDiag) {
                                 subDiag.addMessage(LocAddendum.memberIsWritableInProtocol().format({ name }));
                             }
@@ -635,8 +709,7 @@ function assignClassToProtocolInternal(
                         srcMemberType,
                         subDiag?.createAddendum(),
                         protocolConstraintsClone,
-                        /* srcConstraints */ undefined,
-                        isInvariant ? assignTypeFlags | AssignTypeFlags.EnforceInvariance : assignTypeFlags,
+                        isInvariant ? assignTypeFlags | AssignTypeFlags.Invariant : assignTypeFlags,
                         recursionCount
                     )
                 ) {
@@ -652,28 +725,18 @@ function assignClassToProtocolInternal(
                 }
             }
 
-            const isDestFinal = destSymbol
-                .getTypedDeclarations()
-                .some((decl) => decl.type === DeclarationType.Variable && !!decl.isFinal);
-            const isSrcFinal = srcSymbol
-                .getTypedDeclarations()
-                .some((decl) => decl.type === DeclarationType.Variable && !!decl.isFinal);
-
-            if (isDestFinal !== isSrcFinal) {
-                if (isDestFinal) {
-                    if (subDiag) {
-                        subDiag.addMessage(LocAddendum.memberIsFinalInProtocol().format({ name }));
-                    }
-                } else {
-                    if (subDiag) {
-                        subDiag.addMessage(LocAddendum.memberIsNotFinalInProtocol().format({ name }));
-                    }
+            if (!isDestReadOnly && isSrcReadOnly) {
+                if (subDiag) {
+                    subDiag.addMessage(LocAddendum.memberIsNotReadOnlyInProtocol().format({ name }));
                 }
                 typesAreConsistent = false;
             }
 
             const isDestClassVar = isEffectivelyClassVar(destSymbol, /* isDataclass */ false);
-            const isSrcClassVar = isEffectivelyClassVar(srcSymbol, /* isDataclass */ false);
+            const isSrcClassVar = isEffectivelyClassVar(
+                srcSymbol,
+                /* isDataclass */ isClass(srcType) && ClassType.isDataClass(srcType)
+            );
             const isSrcVariable = srcSymbol.getDeclarations().some((decl) => decl.type === DeclarationType.Variable);
 
             if (sourceIsClassObject) {
@@ -708,13 +771,10 @@ function assignClassToProtocolInternal(
                 destPrimaryDecl?.type === DeclarationType.Variable &&
                 srcPrimaryDecl?.type === DeclarationType.Variable
             ) {
-                const isDestReadOnly = !!destPrimaryDecl.isConstant;
+                const isDestReadOnly = !!destPrimaryDecl.isConstant || !!destPrimaryDecl.isFinal;
                 let isSrcReadOnly = !!srcPrimaryDecl.isConstant;
                 if (srcMemberInfo && isClass(srcMemberInfo.classType)) {
-                    if (
-                        ClassType.isReadOnlyInstanceVariables(srcMemberInfo.classType) ||
-                        ClassType.isDataClassFrozen(srcMemberInfo.classType)
-                    ) {
+                    if (srcMemberInfo.isReadOnly) {
                         isSrcReadOnly = true;
                     }
                 }
@@ -741,24 +801,16 @@ function assignClassToProtocolInternal(
 
         if (destType.priv.typeArgs) {
             if (
-                !evaluator.assignTypeArgs(
-                    destType,
-                    specializedProtocolType,
-                    diag,
-                    destConstraints,
-                    srcConstraints,
-                    flags,
-                    recursionCount
-                )
+                !evaluator.assignTypeArgs(destType, specializedProtocolType, diag, constraints, flags, recursionCount)
             ) {
                 typesAreConsistent = false;
             }
-        } else if (destConstraints && !destConstraints.isLocked()) {
+        } else if (constraints) {
             for (const typeParam of destType.shared.typeParams) {
                 const typeArgEntry = protocolConstraints.getMainConstraintSet().getTypeVar(typeParam);
 
                 if (typeArgEntry) {
-                    destConstraints.copyBounds(typeArgEntry);
+                    constraints.copyBounds(typeArgEntry);
                 }
             }
         }
@@ -796,13 +848,13 @@ function createProtocolConstraints(
                 flags = AssignTypeFlags.Default;
                 hasUnsolvedTypeVars = requiresSpecialization(typeArg);
             } else {
-                flags = AssignTypeFlags.PopulatingExpectedType;
+                flags = AssignTypeFlags.PopulateExpectedType;
 
                 const variance = TypeVarType.getVariance(typeParam);
                 if (variance === Variance.Invariant) {
-                    flags |= AssignTypeFlags.EnforceInvariance;
+                    flags |= AssignTypeFlags.Invariant;
                 } else if (variance === Variance.Contravariant) {
-                    flags |= AssignTypeFlags.ReverseTypeVarMatching;
+                    flags |= AssignTypeFlags.Contravariant;
                 }
             }
 

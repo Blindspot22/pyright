@@ -21,14 +21,15 @@ import {
 } from '../analyzer/declaration';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { SourceMapper, isStubFile } from '../analyzer/sourceMapper';
+import { SynthesizedTypeInfo } from '../analyzer/symbol';
 import { TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
 import { doForEachSubtype } from '../analyzer/typeUtils';
-import { TypeCategory, isOverloadedFunction } from '../analyzer/types';
+import { OverloadedType, TypeCategory, isOverloaded } from '../analyzer/types';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { appendArray } from '../common/collectionUtils';
 import { isDefined } from '../common/core';
 import { ProgramView } from '../common/extensibility';
-import { convertPositionToOffset } from '../common/positionUtils';
+import { convertOffsetsToRange, convertPositionToOffset } from '../common/positionUtils';
 import { ServiceKeys } from '../common/serviceKeys';
 import { ServiceProvider } from '../common/serviceProvider';
 import { DocumentRange, Position, rangesAreEqual } from '../common/textRange';
@@ -88,8 +89,8 @@ export function addDeclarationsToDefinitions(
         if (isFunctionDeclaration(resolvedDecl)) {
             // Handle overloaded function case
             const functionType = evaluator.getTypeForDeclaration(resolvedDecl)?.type;
-            if (functionType && isOverloadedFunction(functionType)) {
-                for (const overloadDecl of functionType.priv.overloads
+            if (functionType && isOverloaded(functionType)) {
+                for (const overloadDecl of OverloadedType.getOverloads(functionType)
                     .map((o) => o.shared.declaration)
                     .filter(isDefined)) {
                     _addIfUnique(definitions, {
@@ -169,11 +170,17 @@ class DefinitionProviderBase {
         // There should be only one 'definition', so only if extensions failed should we try again.
         if (definitions.length === 0) {
             if (node.nodeType === ParseNodeType.Name) {
-                const declarations = this.evaluator.getDeclarationsForNameNode(node);
-                this.resolveDeclarations(declarations, definitions);
+                const declInfo = this.evaluator.getDeclInfoForNameNode(node);
+                if (declInfo) {
+                    this.resolveDeclarations(declInfo.decls, definitions);
+                    this.addSynthesizedTypes(declInfo.synthesizedTypes, definitions);
+                }
             } else if (node.nodeType === ParseNodeType.String) {
-                const declarations = this.evaluator.getDeclarationsForStringNode(node);
-                this.resolveDeclarations(declarations, definitions);
+                const declInfo = this.evaluator.getDeclInfoForStringNode(node);
+                if (declInfo) {
+                    this.resolveDeclarations(declInfo.decls, definitions);
+                    this.addSynthesizedTypes(declInfo.synthesizedTypes, definitions);
+                }
             }
         }
 
@@ -186,6 +193,23 @@ class DefinitionProviderBase {
 
     protected resolveDeclarations(declarations: Declaration[] | undefined, definitions: DocumentRange[]) {
         addDeclarationsToDefinitions(this.evaluator, this.sourceMapper, declarations, definitions);
+    }
+
+    protected addSynthesizedTypes(synthTypes: SynthesizedTypeInfo[], definitions: DocumentRange[]) {
+        for (const synthType of synthTypes) {
+            if (!synthType.node) {
+                continue;
+            }
+
+            const fileInfo = getFileInfo(synthType.node);
+            const range = convertOffsetsToRange(
+                synthType.node.start,
+                synthType.node.start + synthType.node.length,
+                fileInfo.lines
+            );
+
+            definitions.push({ uri: fileInfo.fileUri, range });
+        }
     }
 }
 
@@ -270,13 +294,13 @@ export class TypeDefinitionProvider extends DefinitionProviderBase {
                 // Fall back to Go To Definition if the type can't be found (ex. Go To Type Definition
                 // was executed on a type name)
                 if (declarations.length === 0) {
-                    declarations = this.evaluator.getDeclarationsForNameNode(this.node) ?? [];
+                    declarations = this.evaluator.getDeclInfoForNameNode(this.node)?.decls ?? [];
                 }
 
                 this.resolveDeclarations(declarations, definitions);
             }
         } else if (this.node.nodeType === ParseNodeType.String) {
-            const declarations = this.evaluator.getDeclarationsForStringNode(this.node);
+            const declarations = this.evaluator.getDeclInfoForStringNode(this.node)?.decls;
             this.resolveDeclarations(declarations, definitions);
         }
 

@@ -304,7 +304,9 @@ export class Tokenizer {
 
         // Insert an implied new line to make parsing easier.
         if (this._tokens.length === 0 || this._tokens[this._tokens.length - 1].type !== TokenType.NewLine) {
-            this._tokens.push(NewLineToken.create(this._cs.position, 0, NewLineType.Implied, this._getComments()));
+            if (this._parenDepth === 0) {
+                this._tokens.push(NewLineToken.create(this._cs.position, 0, NewLineType.Implied, this._getComments()));
+            }
         }
 
         // Insert any implied dedent tokens.
@@ -383,6 +385,16 @@ export class Tokenizer {
         }
 
         return !_softKeywords.has(name);
+    }
+
+    static isPythonIdentifier(value: string) {
+        for (let i = 0; i < value.length; i++) {
+            if (i === 0 ? !isIdentifierStartChar(value.charCodeAt(i)) : !isIdentifierChar(value.charCodeAt(i))) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     static isOperatorAssignment(operatorType?: OperatorType): boolean {

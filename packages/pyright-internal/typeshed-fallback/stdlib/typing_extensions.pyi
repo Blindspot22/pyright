@@ -261,7 +261,7 @@ OrderedDict = _Alias()
 def get_type_hints(
     obj: Callable[..., Any],
     globalns: dict[str, Any] | None = None,
-    localns: dict[str, Any] | None = None,
+    localns: Mapping[str, Any] | None = None,
     include_extras: bool = False,
 ) -> dict[str, Any]: ...
 def get_args(tp: Any) -> tuple[Any, ...]: ...
@@ -531,3 +531,11 @@ class Doc:
     def __init__(self, documentation: str, /) -> None: ...
     def __hash__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
+
+
+# PEP 747 (Draft)
+
+if sys.version_info >= (3, 14):
+    from typing import TypeForm
+else:
+    TypeForm: _SpecialForm

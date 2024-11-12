@@ -8,7 +8,7 @@
  */
 
 import { assert } from '../common/debug';
-import { pythonVersion3_13 } from '../common/pythonVersion';
+import { PythonVersion, pythonVersion3_13 } from '../common/pythonVersion';
 import { ArgCategory, ExpressionNode, NameNode, ParseNode, ParseNodeType } from '../parser/parseNodes';
 import { getFileInfo } from './analyzerNodeInfo';
 import { VariableDeclaration } from './declaration';
@@ -33,7 +33,7 @@ import {
     isClassInstance,
     isFunction,
     isInstantiableClass,
-    isOverloadedFunction,
+    isOverloaded,
     maxTypeRecursionCount,
 } from './types';
 
@@ -56,7 +56,11 @@ export function isEnumClassWithMembers(evaluator: TypeEvaluator, classType: Clas
 
     ClassType.getSymbolTable(classType).forEach((symbol, name) => {
         const symbolType = transformTypeForEnumMember(evaluator, classType, name);
-        if (symbolType && isClassInstance(symbolType) && ClassType.isSameGenericClass(symbolType, classType)) {
+        if (
+            symbolType &&
+            isClassInstance(symbolType) &&
+            ClassType.isSameGenericClass(symbolType, ClassType.cloneAsInstance(classType))
+        ) {
             definesMember = true;
         }
     });
@@ -413,7 +417,10 @@ export function transformTypeForEnumMember(
             // are treated as members.
             if (isInstantiableClass(assignedType)) {
                 const fileInfo = getFileInfo(primaryDecl.node);
-                isMemberOfEnumeration = fileInfo.executionEnvironment.pythonVersion.isLessThan(pythonVersion3_13);
+                isMemberOfEnumeration = PythonVersion.isLessThan(
+                    fileInfo.executionEnvironment.pythonVersion,
+                    pythonVersion3_13
+                );
             }
         }
     }
@@ -444,7 +451,7 @@ export function transformTypeForEnumMember(
 
     // The enum spec doesn't explicitly specify this, but it
     // appears that callables are excluded.
-    if (!findSubtype(valueType, (subtype) => !isFunction(subtype) && !isOverloadedFunction(subtype))) {
+    if (!findSubtype(valueType, (subtype) => !isFunction(subtype) && !isOverloaded(subtype))) {
         return undefined;
     }
 

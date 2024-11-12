@@ -22,7 +22,7 @@ import * as StringUtils from '../common/stringUtils';
 import { equateStringsCaseInsensitive } from '../common/stringUtils';
 import { Uri } from '../common/uri/uri';
 import { getFileSystemEntriesFromDirEntries, isDirectory, isFile, tryRealpath, tryStat } from '../common/uri/uriUtils';
-import { isIdentifierChar, isIdentifierStartChar } from '../parser/characters';
+import { Tokenizer } from '../parser/tokenizer';
 import { ImplicitImport, ImportResult, ImportType } from './importResult';
 import { getDirectoryLeadingDotsPointsTo } from './importStatementUtils';
 import { ImportPath, ParentDirectoryCache } from './parentDirectoryCache';
@@ -448,7 +448,7 @@ export class ImportResolver {
     }
 
     getTypeshedStdlibExcludeList(
-        customTypeshedPath: Uri,
+        customTypeshedPath: Uri | undefined,
         pythonVersion: PythonVersion,
         pythonPlatform: string | undefined
     ): Uri[] {
@@ -472,7 +472,7 @@ export class ImportResolver {
         this._cachedTypeshedStdLibModuleVersionInfo.forEach((versionInfo, moduleName) => {
             let shouldExcludeModule = false;
 
-            if (versionInfo.max !== undefined && pythonVersion.isGreaterThan(versionInfo.max)) {
+            if (versionInfo.max !== undefined && PythonVersion.isGreaterThan(pythonVersion, versionInfo.max)) {
                 shouldExcludeModule = true;
             }
 
@@ -507,6 +507,12 @@ export class ImportResolver {
         });
 
         return excludes;
+    }
+
+    // Intended to be overridden by subclasses to provide additional stub
+    // path capabilities. Return undefined if no extra stub path were found.
+    getTypeshedPathEx(execEnv: ExecutionEnvironment, importFailureInfo: string[]): Uri | undefined {
+        return undefined;
     }
 
     protected readdirEntriesCached(uri: Uri): Dirent[] {
@@ -742,12 +748,6 @@ export class ImportResolver {
             allowPyi,
             lookForPyTyped
         );
-    }
-
-    // Intended to be overridden by subclasses to provide additional stub
-    // path capabilities. Return undefined if no extra stub path were found.
-    protected getTypeshedPathEx(execEnv: ExecutionEnvironment, importFailureInfo: string[]): Uri | undefined {
-        return undefined;
     }
 
     // Intended to be overridden by subclasses to provide additional stub
@@ -1999,11 +1999,11 @@ export class ImportResolver {
             const versionInfo = this._cachedTypeshedStdLibModuleVersionInfo.get(namePartsToConsider.join('.'));
 
             if (versionInfo) {
-                if (pythonVersion.isLessThan(versionInfo.min)) {
+                if (PythonVersion.isLessThan(pythonVersion, versionInfo.min)) {
                     return false;
                 }
 
-                if (versionInfo.max !== undefined && pythonVersion.isGreaterThan(versionInfo.max)) {
+                if (versionInfo.max !== undefined && PythonVersion.isGreaterThan(pythonVersion, versionInfo.max)) {
                     return false;
                 }
 
@@ -2660,7 +2660,7 @@ export class ImportResolver {
     ): boolean {
         let isNativeLib = false;
 
-        if (this.dirExistsCached(fileDirectory)) {
+        if (!execEnv.skipNativeLibraries && this.dirExistsCached(fileDirectory)) {
             const filesInDir = this._getFilesInDirectory(fileDirectory);
             const dirName = dirPath.fileName;
             const nativeLibPath = filesInDir.find((f) => this._isNativeModuleFileName(dirName, f));
@@ -2818,7 +2818,7 @@ function _getModuleNameInfoFromPath(
     }
 
     // Check whether parts contains invalid characters.
-    const containsInvalidCharacters = parts.some((p) => !_isIdentifier(p));
+    const containsInvalidCharacters = parts.some((p) => !Tokenizer.isPythonIdentifier(p));
 
     return {
         moduleName: parts.join('.'),
@@ -2832,14 +2832,4 @@ function _isNativeModuleFileExtension(fileExtension: string): boolean {
 
 function _isDefaultWorkspace(uri: Uri | undefined) {
     return !uri || uri.isEmpty() || Uri.isDefaultWorkspace(uri);
-}
-
-function _isIdentifier(value: string) {
-    for (let i = 0; i < value.length; i++) {
-        if (i === 0 ? !isIdentifierStartChar(value.charCodeAt(i)) : !isIdentifierChar(value.charCodeAt(i))) {
-            return false;
-        }
-    }
-
-    return true;
 }

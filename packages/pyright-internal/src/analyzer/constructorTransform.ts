@@ -18,7 +18,7 @@ import { ArgCategory, ExpressionNode, ParamCategory } from '../parser/parseNodes
 import { ConstraintTracker } from './constraintTracker';
 import { createFunctionFromConstructor } from './constructors';
 import { getParamListDetails, ParamKind } from './parameterUtils';
-import { Symbol, SymbolFlags } from './symbol';
+import { getTypedDictMembersForClass } from './typedDicts';
 import { Arg, FunctionResult, TypeEvaluator } from './typeEvaluatorTypes';
 import {
     AnyType,
@@ -29,11 +29,13 @@ import {
     isClassInstance,
     isFunction,
     isInstantiableClass,
-    isOverloadedFunction,
+    isOverloaded,
     isTypeSame,
     isTypeVar,
-    OverloadedFunctionType,
+    isUnpackedClass,
+    OverloadedType,
     Type,
+    TypedDictEntry,
 } from './types';
 import { convertToInstance, lookUpObjectMember, makeInferenceContext, MemberAccessFlags } from './typeUtils';
 
@@ -51,7 +53,7 @@ export function applyConstructorTransform(
     argList: Arg[],
     classType: ClassType,
     result: FunctionResult
-): FunctionResult {
+): FunctionResult | undefined {
     if (classType.shared.fullName === 'functools.partial') {
         return applyPartialTransform(evaluator, errorNode, argList, result);
     }
@@ -66,24 +68,24 @@ function applyPartialTransform(
     errorNode: ExpressionNode,
     argList: Arg[],
     result: FunctionResult
-): FunctionResult {
+): FunctionResult | undefined {
     // We assume that the normal return result is a functools.partial class instance.
     if (!isClassInstance(result.returnType) || result.returnType.shared.fullName !== 'functools.partial') {
-        return result;
+        return undefined;
     }
 
     const callMemberResult = lookUpObjectMember(result.returnType, '__call__', MemberAccessFlags.SkipInstanceMembers);
     if (!callMemberResult || !isTypeSame(convertToInstance(callMemberResult.classType), result.returnType)) {
-        return result;
+        return undefined;
     }
 
     const callMemberType = evaluator.getTypeOfMember(callMemberResult);
     if (!isFunction(callMemberType) || callMemberType.shared.parameters.length < 1) {
-        return result;
+        return undefined;
     }
 
     if (argList.length < 1) {
-        return result;
+        return undefined;
     }
 
     const origFunctionTypeResult = evaluator.getTypeOfArg(argList[0], /* inferenceContext */ undefined);
@@ -107,7 +109,7 @@ function applyPartialTransform(
 
     // We don't currently handle unpacked arguments.
     if (argList.some((arg) => arg.argCategory !== ArgCategory.Simple)) {
-        return result;
+        return undefined;
     }
 
     // Make sure the first argument is a simple function.
@@ -120,15 +122,11 @@ function applyPartialTransform(
             origFunctionType
         );
         if (!transformResult) {
-            return result;
+            return undefined;
         }
 
         // Create a new copy of the functools.partial class that overrides the __call__ method.
-        const newPartialClass = ClassType.cloneForSymbolTableUpdate(result.returnType);
-        ClassType.getSymbolTable(newPartialClass).set(
-            '__call__',
-            Symbol.createWithType(SymbolFlags.ClassMember, transformResult.returnType)
-        );
+        const newPartialClass = ClassType.cloneForPartial(result.returnType, transformResult.returnType);
 
         return {
             returnType: newPartialClass,
@@ -137,12 +135,13 @@ function applyPartialTransform(
         };
     }
 
-    if (isOverloadedFunction(origFunctionType)) {
+    if (isOverloaded(origFunctionType)) {
         const applicableOverloads: FunctionType[] = [];
+        const overloads = OverloadedType.getOverloads(origFunctionType);
         let sawArgErrors = false;
 
         // Apply the partial transform to each of the functions in the overload.
-        OverloadedFunctionType.getOverloads(origFunctionType).forEach((overload) => {
+        overloads.forEach((overload) => {
             // Apply the transform to this overload, but don't report errors.
             const transformResult = applyPartialTransformToFunction(
                 evaluator,
@@ -162,27 +161,24 @@ function applyPartialTransform(
         });
 
         if (applicableOverloads.length === 0) {
-            if (sawArgErrors) {
+            if (sawArgErrors && overloads.length > 0) {
                 evaluator.addDiagnostic(
                     DiagnosticRule.reportCallIssue,
                     LocMessage.noOverload().format({
-                        name: origFunctionType.priv.overloads[0].shared.name,
+                        name: overloads[0].shared.name,
                     }),
                     errorNode
                 );
             }
 
-            return result;
+            return undefined;
         }
-
-        // Create a new copy of the functools.partial class that overrides the __call__ method.
-        const newPartialClass = ClassType.cloneForSymbolTableUpdate(result.returnType);
 
         let synthesizedCallType: Type;
         if (applicableOverloads.length === 1) {
             synthesizedCallType = applicableOverloads[0];
         } else {
-            synthesizedCallType = OverloadedFunctionType.create(
+            synthesizedCallType = OverloadedType.create(
                 // Set the "overloaded" flag for each of the __call__ overloads.
                 applicableOverloads.map((overload) =>
                     FunctionType.cloneWithNewFlags(overload, overload.shared.flags | FunctionTypeFlags.Overloaded)
@@ -190,10 +186,8 @@ function applyPartialTransform(
             );
         }
 
-        ClassType.getSymbolTable(newPartialClass).set(
-            '__call__',
-            Symbol.createWithType(SymbolFlags.ClassMember, synthesizedCallType)
-        );
+        // Create a new copy of the functools.partial class that overrides the __call__ method.
+        const newPartialClass = ClassType.cloneForPartial(result.returnType, synthesizedCallType);
 
         return {
             returnType: newPartialClass,
@@ -202,7 +196,7 @@ function applyPartialTransform(
         };
     }
 
-    return result;
+    return undefined;
 }
 
 function applyPartialTransformToFunction(
@@ -413,7 +407,29 @@ function applyPartialTransformToFunction(
     // Create a new parameter list that omits parameters that have been
     // populated already.
     const updatedParamList: FunctionParam[] = specializedFunctionType.shared.parameters.map((param, index) => {
-        const newType = FunctionType.getParamType(specializedFunctionType, index);
+        let newType = FunctionType.getParamType(specializedFunctionType, index);
+
+        // If this is an **kwargs with an unpacked TypedDict, mark the provided
+        // TypedDict entries as provided.
+        if (
+            param.category === ParamCategory.KwargsDict &&
+            isClassInstance(newType) &&
+            isUnpackedClass(newType) &&
+            ClassType.isTypedDictClass(newType)
+        ) {
+            const typedDictEntries = getTypedDictMembersForClass(evaluator, newType);
+            const narrowedEntriesMap = new Map<string, TypedDictEntry>(newType.priv.typedDictNarrowedEntries ?? []);
+
+            typedDictEntries.knownItems.forEach((entry, name) => {
+                if (paramMap.has(name)) {
+                    narrowedEntriesMap.set(name, { ...entry, isRequired: false });
+                }
+            });
+
+            newType = ClassType.cloneAsInstance(
+                ClassType.cloneForNarrowedTypedDictEntries(newType, narrowedEntriesMap)
+            );
+        }
 
         // If it's a keyword parameter that has been assigned a value through
         // the "partial" mechanism, mark it has having a default value.

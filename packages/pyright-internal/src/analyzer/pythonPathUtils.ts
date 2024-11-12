@@ -56,7 +56,7 @@ export function findPythonSearchPaths(
     importFailureInfo: string[],
     includeWatchPathsOnly?: boolean | undefined,
     workspaceRoot?: Uri | undefined
-): Uri[] | undefined {
+): Uri[] {
     importFailureInfo.push('Finding python search paths');
 
     if (configOptions.venvPath !== undefined && configOptions.venv) {
@@ -156,7 +156,7 @@ function findSitePackagesPath(
     // version), prefer that over other python directories.
     if (pythonVersion) {
         const preferredDir = candidateDirs.find(
-            (dirName) => dirName.fileName === `python${pythonVersion.toMajorMinorString()}`
+            (dirName) => dirName.fileName === `python${PythonVersion.toMajorMinorString(pythonVersion)}`
         );
         if (preferredDir) {
             const dirPath = preferredDir.combinePaths(pathConsts.sitePackages);

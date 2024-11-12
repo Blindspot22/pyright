@@ -1,16 +1,18 @@
 # This sample tests the assignment of protocols that
 # include property declarations.
 
+from _typeshed import DataclassInstance
+from dataclasses import dataclass
 from typing import (
     ClassVar,
     ContextManager,
+    Final,
     Generic,
     NamedTuple,
     Protocol,
     Sequence,
     TypeVar,
 )
-from dataclasses import dataclass
 
 
 class Class1(Protocol):
@@ -110,14 +112,12 @@ _Self = TypeVar("_Self")
 
 class Class5:
     @property
-    def real(self: _Self) -> _Self:
-        ...
+    def real(self: _Self) -> _Self: ...
 
 
 class MockClass5(Protocol[_T_co]):
     @property
-    def real(self) -> _T_co:
-        ...
+    def real(self) -> _T_co: ...
 
 
 foo5 = Class5()
@@ -130,14 +130,12 @@ C6 = TypeVar("C6", bound="Class6")
 
 class MockClass6(Protocol):
     @property
-    def bar(self: P6) -> ContextManager[P6]:
-        ...
+    def bar(self: P6) -> ContextManager[P6]: ...
 
 
 class Class6:
     @property
-    def bar(self: C6) -> ContextManager[C6]:
-        ...
+    def bar(self: C6) -> ContextManager[C6]: ...
 
 
 i: MockClass6 = Class6()
@@ -158,8 +156,7 @@ a: Proto7 = Class7("")
 
 class Proto8(Protocol):
     @property
-    def x(self) -> str:
-        ...
+    def x(self) -> str: ...
 
 
 class Class8(NamedTuple):
@@ -171,12 +168,10 @@ b: Proto8 = Class8("")
 
 class Proto9(Protocol):
     @property
-    def x(self) -> str:
-        ...
+    def x(self) -> str: ...
 
     @x.setter
-    def x(self, n: str) -> None:
-        ...
+    def x(self, n: str) -> None: ...
 
 
 class Proto10(Protocol):
@@ -255,12 +250,10 @@ T13 = TypeVar("T13", covariant=True)
 
 class Proto13(Protocol[T13]):
     @property
-    def prop1(self) -> T13:
-        ...
+    def prop1(self) -> T13: ...
 
 
-class Proto14(Proto13[T13], Protocol):
-    ...
+class Proto14(Proto13[T13], Protocol): ...
 
 
 class Concrete14(Generic[T13]):
@@ -268,8 +261,68 @@ class Concrete14(Generic[T13]):
         self.prop1 = val
 
 
-def func14(val: Proto14[T13]):
-    ...
+def func14(val: Proto14[T13]): ...
 
 
 func14(Concrete14(1))
+
+
+class Proto15(Protocol):
+    @property
+    def prop1(self) -> int:
+        return 0
+
+
+class Concrete15_1:
+    prop1: Final[int] = 0
+
+
+class Concrete15_2:
+    prop1: int = 0
+
+
+class Concrete15_3:
+    prop1: int
+
+    def __init__(self):
+        self.prop1 = 0
+
+
+@dataclass
+class Concrete15_4:
+    prop1: Final[int] = 0
+
+
+@dataclass(frozen=True)
+class Concrete15_5:
+    prop1: int = 0
+
+
+# This should generate an error because it is not a ClassVar in the protocol.
+p15_1: Proto15 = Concrete15_1()
+
+p15_2: Proto15 = Concrete15_2()
+p15_3: Proto15 = Concrete15_3()
+
+p15_4_1: Proto15 = Concrete15_4()
+p15_4_2: DataclassInstance = Concrete15_4()
+
+p15_5_1: Proto15 = Concrete15_5()
+p15_5_2: DataclassInstance = Concrete15_5()
+
+
+class Proto16(Protocol):
+    __name__: str
+
+
+class Concrete16_1(NamedTuple):
+    other: int
+
+
+@dataclass(frozen=True)
+class Concrete16_2:
+    other: int
+
+
+p16_1: Proto16 = Concrete16_1
+p16_2: Proto16 = Concrete16_2
